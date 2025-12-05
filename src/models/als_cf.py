@@ -14,13 +14,13 @@ class ALSRecommender:
     """
     Implicit-feedback ALS for candidate generation.
 
-    Compatibility + correctness:
+    Correctness + stability fixes:
+    - Use GLOBAL n_users/n_items from users/items mapping files.
+      This prevents index errors for users absent in train after time-split.
     - Build USER-ITEM matrix for recommend-time filtering.
     - Fit ALS on ITEM-USER matrix (transpose), as expected by implicit.
-    - Pass a 1-row user_items slice to recommend() to satisfy validation.
-    - Support multiple implicit return shapes for recommend():
-        A) list[(item, score)]
-        B) (item_ids_array, scores_array)
+    - Pass a 1-row user_items slice to recommend().
+    - Support multiple recommend() return shapes across implicit versions.
     """
 
     def __init__(
@@ -38,31 +38,53 @@ class ALSRecommender:
         self.random_state = random_state
 
         self.model: AlternatingLeastSquares | None = None
-        self.user_item: csr_matrix | None = None  # shape: (n_users, n_items)
+        self.user_item: csr_matrix | None = None  # (n_users, n_items)
+
         self.n_users: int = 0
         self.n_items: int = 0
 
-    def _build_user_item_matrix(self, path: str) -> Tuple[csr_matrix, int, int]:
+    def _load_global_dimensions(self) -> Tuple[int, int]:
+        users_path = settings.PROCESSED_DIR / "users.parquet"
+        items_path = settings.PROCESSED_DIR / "items.parquet"
+
+        if not users_path.exists() or not items_path.exists():
+            raise FileNotFoundError(
+                "users.parquet/items.parquet not found. "
+                "Run src.data.prepare_interactions first."
+            )
+
+        users_df = pl.read_parquet(users_path)
+        items_df = pl.read_parquet(items_path)
+
+        # users/items were created with row_index as *_idx
+        n_users = users_df.height
+        n_items = items_df.height
+
+        return int(n_users), int(n_items)
+
+    def _build_user_item_matrix(self, path: str, n_users: int, n_items: int) -> csr_matrix:
         df = pl.read_parquet(path).select("user_idx", "item_idx", "is_positive")
+
+        if df.is_empty():
+            # No train interactions; return an all-zero matrix
+            return csr_matrix((n_users, n_items), dtype=np.float32)
 
         users = df["user_idx"].to_numpy()
         items = df["item_idx"].to_numpy()
         vals = df["is_positive"].to_numpy().astype(np.float32)
 
-        n_users = int(df["user_idx"].max()) + 1
-        n_items = int(df["item_idx"].max()) + 1
-
         mat = csr_matrix((vals, (users, items)), shape=(n_users, n_items))
-        return mat, n_users, n_items
+        return mat
 
     def fit(self, train_path: str | None = None) -> "ALSRecommender":
         path = train_path or str(settings.PROCESSED_DIR / "train.parquet")
 
-        user_item, n_users, n_items = self._build_user_item_matrix(path)
-
-        self.user_item = user_item
+        n_users, n_items = self._load_global_dimensions()
         self.n_users = n_users
         self.n_items = n_items
+
+        user_item = self._build_user_item_matrix(path, n_users, n_items)
+        self.user_item = user_item
 
         # implicit expects item-user for fitting
         item_user = user_item.T.tocsr()
@@ -88,30 +110,33 @@ class ALSRecommender:
         # Option B: (item_ids_array, scores_array)
         if isinstance(recs, tuple) and len(recs) == 2:
             item_ids = recs[0]
-            # scores = recs[1]  # we don't need scores in MVP
             return [int(i) for i in item_ids.tolist()]
 
         # Option A: list of tuples
         if isinstance(recs, list):
             out: List[int] = []
             for row in recs:
-                # row may be tuple-like
                 try:
-                    item_id = row[0]
-                    out.append(int(item_id))
+                    out.append(int(row[0]))
                 except Exception:
                     continue
             return out
 
-        # Fallback (should not happen)
         return []
 
     def recommend(self, user_idx: int, k: int = 50) -> List[int]:
         if self.model is None or self.user_item is None:
             raise RuntimeError("ALSRecommender is not fitted yet.")
 
+        # Guard: if user outside global bounds
         if user_idx < 0 or user_idx >= self.n_users:
             return []
+
+        # Guard: if implicit internally returns smaller user_factors
+        # (rare, but safe for local MVP)
+        if hasattr(self.model, "user_factors"):
+            if user_idx >= self.model.user_factors.shape[0]:
+                return []
 
         user_items_1row = self.user_item[user_idx]
 
