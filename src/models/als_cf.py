@@ -11,24 +11,37 @@ from src.config.settings import settings
 
 
 class ALSRecommender:
+    """
+    Implicit-feedback ALS for candidate generation.
+
+    Key correctness details:
+    - Build USER-ITEM matrix for recommend-time filtering.
+    - Fit ALS on ITEM-USER matrix (transpose), as expected by implicit.
+    - Pass a 1-row user_items slice to recommend() to avoid shape validation errors.
+    """
+
     def __init__(
         self,
         factors: int = 128,
         regularization: float = 0.08,
         iterations: int = 20,
         alpha: float = 40.0,
+        random_state: int = 42,
     ) -> None:
         self.factors = factors
         self.regularization = regularization
         self.iterations = iterations
         self.alpha = alpha
+        self.random_state = random_state
 
         self.model: AlternatingLeastSquares | None = None
-        self.user_item: csr_matrix | None = None
+        self.user_item: csr_matrix | None = None  # shape: (n_users, n_items)
+        self.n_users: int = 0
+        self.n_items: int = 0
 
-    def _build_matrix(self, path: str) -> Tuple[csr_matrix, int, int]:
+    def _build_user_item_matrix(self, path: str) -> Tuple[csr_matrix, int, int]:
         df = pl.read_parquet(path).select("user_idx", "item_idx", "is_positive")
-        # implicit expects confidence > 0
+
         users = df["user_idx"].to_numpy()
         items = df["item_idx"].to_numpy()
         vals = df["is_positive"].to_numpy().astype(np.float32)
@@ -41,35 +54,50 @@ class ALSRecommender:
 
     def fit(self, train_path: str | None = None) -> ALSRecommender:
         path = train_path or str(settings.PROCESSED_DIR / "train.parquet")
-        mat, _, _ = self._build_matrix(path)
 
-        # confidence scaling
-        mat = mat * self.alpha
+        user_item, n_users, n_items = self._build_user_item_matrix(path)
 
-        self.user_item = mat
+        # Store for filtering already-liked items during recommend
+        self.user_item = user_item
+        self.n_users = n_users
+        self.n_items = n_items
+
+        # implicit ALS expects ITEM-USER matrix for training
+        item_user = user_item.T.tocsr()
+
+        # Confidence scaling
+        item_user = item_user * self.alpha
 
         model = AlternatingLeastSquares(
             factors=self.factors,
             regularization=self.regularization,
             iterations=self.iterations,
-            random_state=42,
+            random_state=self.random_state,
         )
-        model.fit(mat)
 
+        model.fit(item_user)
         self.model = model
+
         return self
 
     def recommend(self, user_idx: int, k: int = 50) -> List[int]:
         if self.model is None or self.user_item is None:
-            raise RuntimeError("Model not fitted.")
+            raise RuntimeError("ALSRecommender is not fitted yet.")
+
+        if user_idx < 0 or user_idx >= self.n_users:
+            return []
+
+        # Provide exactly 1 row of user_items to satisfy implicit validation
+        user_items_1row = self.user_item[user_idx]
 
         recs = self.model.recommend(
             userid=user_idx,
-            user_items=self.user_item,
+            user_items=user_items_1row,
             N=k,
-            filter_already_liked_items=True
+            filter_already_liked_items=True,
         )
+
         return [int(i) for i, _ in recs]
 
-    def batch_recommend(self, user_ids: list[int], k: int = 50) -> Dict[int, List[int]]:
+    def batch_recommend(self, user_ids: List[int], k: int = 50) -> Dict[int, List[int]]:
         return {u: self.recommend(u, k) for u in user_ids}
