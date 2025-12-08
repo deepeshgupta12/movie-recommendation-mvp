@@ -12,22 +12,15 @@ from src.config.settings import settings
 
 @dataclass
 class RankingSampleConfig:
-    negatives_per_positive: int = 4
+    # Local-first defaults for M1 stability
+    negatives_per_positive: int = 2
     min_positive_conf: float = 0.1
     seed: int = 42
-    top_pop_pool: int = 5000  # negative sampling pool size
+    top_pop_pool: int = 5000
 
-
-def _load_movies() -> pl.DataFrame:
-    return pl.read_parquet(settings.PROCESSED_DIR / "movies.parquet").select(
-        pl.col("movieId"),
-        pl.col("title"),
-        pl.col("genres")
-    )
-
-
-def _load_items_map() -> pl.DataFrame:
-    return pl.read_parquet(settings.PROCESSED_DIR / "items.parquet")
+    # NEW: caps for local iteration
+    max_users: int = 50000
+    max_positives_per_user: int = 50
 
 
 def _build_item_popularity(train_conf: pl.DataFrame) -> pl.DataFrame:
@@ -62,7 +55,6 @@ def main() -> None:
 
     print("[START] Building user->positive map...")
     user_pos: Dict[int, Set[int]] = {}
-    # This loop is large; show progress
     for u, i in tqdm(
         pos.select("user_idx", "item_idx").iter_rows(),
         total=pos.height,
@@ -70,35 +62,43 @@ def main() -> None:
     ):
         user_pos.setdefault(int(u), set()).add(int(i))
 
-    print(f"[OK] users with >=1 positive: {len(user_pos)}")
+    all_users = list(user_pos.keys())
+    print(f"[OK] users with >=1 positive (raw): {len(all_users)}")
+
+    # Apply user cap
+    if len(all_users) > cfg.max_users:
+        all_users = all_users[:cfg.max_users]
+        print(f"[OK] users after cap: {len(all_users)}")
 
     rng = np.random.default_rng(cfg.seed)
 
-    def pop_bucket_from_rank(rank: int) -> int:
-        if rank <= 100:
-            return 1
-        if rank <= 500:
-            return 2
-        if rank <= 2000:
-            return 3
-        return 4
-
-    # Precompute rank for bucket assignment
+    # Precompute pop rank for bucket assignment
     pop_rank = {int(i): r for r, i in enumerate(pop["item_idx"].to_list(), start=1)}
 
     def pop_bucket(item_idx: int) -> int:
         r = pop_rank.get(item_idx, 999999)
-        return pop_bucket_from_rank(r)
+        if r <= 100:
+            return 1
+        if r <= 500:
+            return 2
+        if r <= 2000:
+            return 3
+        return 4
 
-    print("[START] Creating ranking samples...")
+    print("[START] Creating ranking samples (capped for local)...")
     rows: List[Tuple[int, int, float, int]] = []
 
-    # Show progress over users
-    for u, items in tqdm(user_pos.items(), desc="Sampling negatives per user"):
-        items_list = list(items)
+    for u in tqdm(all_users, desc="Sampling negatives per user"):
+        items = list(user_pos.get(u, set()))
+        if not items:
+            continue
 
-        for i in items_list:
-            # Positive row
+        # Apply positives-per-user cap
+        if len(items) > cfg.max_positives_per_user:
+            items = items[:cfg.max_positives_per_user]
+
+        for i in items:
+            # Positive
             rows.append((u, i, 1.0, pop_bucket(i)))
 
             # Negatives
@@ -109,7 +109,7 @@ def main() -> None:
             while len(negs) < target and attempts < target * 10:
                 cand = int(rng.choice(top_pop_items))
                 attempts += 1
-                if cand not in items:
+                if cand not in user_pos[u]:
                     negs.append(cand)
 
             for n in negs:
@@ -118,7 +118,9 @@ def main() -> None:
     print(f"[OK] Total samples built in memory: {len(rows)}")
 
     samples = pl.DataFrame(
-        rows, schema=["user_idx", "item_idx", "label", "pop_bucket"]
+        rows,
+        schema=["user_idx", "item_idx", "label", "pop_bucket"],
+        orient="row",
     )
 
     out = settings.PROCESSED_DIR / "rank_train_pairs.parquet"
