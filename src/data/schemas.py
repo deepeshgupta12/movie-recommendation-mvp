@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Any, Optional, dict  # noqa: UP035
+
 from pydantic import BaseModel, Field
 
 
@@ -53,4 +55,4 @@ class InteractionEvent(BaseModel):
     time_of_day_bucket: Optional[str] = None  # e.g., morning/evening
 
     # Flexible extension for experiments
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)

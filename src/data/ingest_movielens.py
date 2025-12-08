@@ -15,7 +15,6 @@ def _resolve_root() -> Path:
     """
     base = settings.RAW_DIR / settings.MOVIELENS_VARIANT
 
-    # Search for ratings.csv
     matches = list(base.rglob("ratings.csv"))
     if not matches:
         raise FileNotFoundError(f"ratings.csv not found under {base}")
@@ -33,7 +32,6 @@ def ingest() -> None:
     tags_path = root / "tags.csv"
     links_path = root / "links.csv"
 
-    # Lazy reads for speed
     ratings = (
         pl.scan_csv(ratings_path)
         .with_columns(
@@ -76,20 +74,20 @@ def ingest() -> None:
             )
         )
 
-    # Write Parquet
     ratings_out = settings.PROCESSED_DIR / "ratings.parquet"
     movies_out = settings.PROCESSED_DIR / "movies.parquet"
     tags_out = settings.PROCESSED_DIR / "tags.parquet"
     links_out = settings.PROCESSED_DIR / "links.parquet"
 
-    ratings.collect(streaming=True).write_parquet(ratings_out)
-    movies.collect(streaming=True).write_parquet(movies_out)
+    # Polars modern streaming engine
+    ratings.collect(engine="streaming").write_parquet(ratings_out)
+    movies.collect(engine="streaming").write_parquet(movies_out)
 
     if tags is not None:
-        tags.collect(streaming=True).write_parquet(tags_out)
+        tags.collect(engine="streaming").write_parquet(tags_out)
 
     if links is not None:
-        links.collect(streaming=True).write_parquet(links_out)
+        links.collect(engine="streaming").write_parquet(links_out)
 
     print("[DONE] Parquet files created in data/processed")
 
