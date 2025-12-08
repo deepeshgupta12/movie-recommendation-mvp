@@ -1,0 +1,12 @@
+{
+  "feature_cols": [
+    "user_interactions",
+    "user_conf_sum",
+    "user_conf_decay_sum",
+    "user_days_since_last",
+    "item_interactions",
+    "item_conf_sum",
+    "item_conf_decay_sum",
+    "item_days_since_last"
+  ]
+}

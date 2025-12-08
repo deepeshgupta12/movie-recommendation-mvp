@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 import joblib
 import polars as pl
@@ -27,9 +26,6 @@ def main() -> None:
     print(f"[OK] Feature rows: {feat_df.height}")
     print(f"[OK] Build time: {t1 - t0:.2f}s")
 
-    # -----------------------------
-    # Define canonical feature order
-    # -----------------------------
     feature_cols = [
         "user_interactions",
         "user_conf_sum",
@@ -39,14 +35,16 @@ def main() -> None:
         "item_conf_sum",
         "item_conf_decay_sum",
         "item_days_since_last",
+        "item_genre_count",
+        "user_item_genre_aff",
+        "user_item_genre_aff_decay",
     ]
 
-    # Validate presence
     missing = [c for c in feature_cols if c not in feat_df.columns]
     if missing:
         raise ValueError(f"Missing expected V2 features: {missing}")
 
-    y = feat_df["label"].to_numpy()
+    y = feat_df["label"].cast(pl.Int8).to_numpy()
     X = feat_df.select(feature_cols).to_numpy()
 
     X_train, X_val, y_train, y_val = train_test_split(
@@ -54,7 +52,7 @@ def main() -> None:
     )
 
     print(f"[OK] Train size: {len(y_train)} | Val size: {len(y_val)}")
-    print("[START] Training V2 ranker...")
+    print("[START] Training V2 ranker (with genre cross)...")
 
     model = HistGradientBoostingClassifier(
         max_depth=6,
@@ -69,24 +67,31 @@ def main() -> None:
 
     print(f"[OK] Training time: {t3 - t2:.2f}s")
 
-    preds = model.predict_proba(X_val)[:, 1]
+    preds = model.predict_proba(X_val)[:, list(model.classes_).index(1)]
     auc = roc_auc_score(y_val, preds)
 
     models_dir = settings.PROJECT_ROOT / "reports" / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
     out_model = models_dir / "ranker_hgb_v2.pkl"
-    out_meta = models_dir / "ranker_hgb_v2.features.json"
+    out_meta = models_dir / "ranker_hgb_v2.meta.json"
 
     joblib.dump(model, out_model)
 
+    meta = {
+        "feature_cols": feature_cols,
+        "positive_class": 1,
+        "classes_": [int(c) for c in list(model.classes_)],
+    }
+
     with open(out_meta, "w", encoding="utf-8") as f:
-        json.dump({"feature_cols": feature_cols}, f, indent=2)
+        json.dump(meta, f, indent=2)
 
     print(f"[DONE] V2 Ranker trained. AUC={auc:.4f}")
     print(f"[PATH] {out_model}")
     print(f"[PATH] {out_meta}")
     print(f"[OK] Features used (locked order): {feature_cols}")
+    print(f"[OK] Model classes_: {list(model.classes_)}")
 
 
 if __name__ == "__main__":

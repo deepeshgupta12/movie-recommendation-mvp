@@ -34,7 +34,6 @@ def main() -> None:
     ks = [10, 20, 50]
     max_k = max(ks)
 
-    # Candidate models
     pop = PopularityRecommender().fit()
     item_item = ItemItemSimilarityRecommender().fit()
     als = ALSConfidenceRecommender().fit()
@@ -51,12 +50,12 @@ def main() -> None:
 
     models_dir = settings.PROJECT_ROOT / "reports" / "models"
     ranker_path = models_dir / "ranker_hgb_v2.pkl"
-    meta_path = models_dir / "ranker_hgb_v2.features.json"
+    meta_path = models_dir / "ranker_hgb_v2.meta.json"
 
     if not ranker_path.exists():
         raise FileNotFoundError("ranker_hgb_v2.pkl not found. Run train_ranker_v2 first.")
     if not meta_path.exists():
-        raise FileNotFoundError("ranker_hgb_v2.features.json not found. Re-run train_ranker_v2.")
+        raise FileNotFoundError("ranker_hgb_v2.meta.json not found. Re-run train_ranker_v2.")
 
     model = joblib.load(ranker_path)
 
@@ -64,13 +63,47 @@ def main() -> None:
         meta = json.load(f)
 
     feature_cols: List[str] = meta["feature_cols"]
-    print(f"[OK] Loaded feature order: {feature_cols}")
+    positive_class = meta.get("positive_class", 1)
 
-    # Load feature store tables
+    classes_list = list(model.classes_)
+    if positive_class not in classes_list:
+        raise ValueError(f"Positive class {positive_class} not present in model.classes_: {classes_list}")
+
+    pos_idx = classes_list.index(positive_class)
+
+    print(f"[OK] Loaded feature order: {feature_cols}")
+    print(f"[OK] Model classes_: {classes_list} | positive_class={positive_class} | pos_idx={pos_idx}")
+
+    # Load feature store artifacts
     user_feat = pl.read_parquet(settings.PROCESSED_DIR / "user_features.parquet")
     item_feat = pl.read_parquet(settings.PROCESSED_DIR / "item_features.parquet")
+    item_genre_count = (
+        pl.read_parquet(settings.PROCESSED_DIR / "item_genres_expanded.parquet")
+        .group_by("item_idx")
+        .agg(pl.len().alias("item_genre_count"))
+    )
+    user_item_aff = None  # noqa: F841
 
-    # Build lookup dicts
+    # Precompute user-item affinity for fast lookup by reading from feature table join source
+    # We'll build a lightweight map from user_genre_affinity + item_genres.
+    item_genres = pl.read_parquet(settings.PROCESSED_DIR / "item_genres_expanded.parquet")
+    user_genre = pl.read_parquet(settings.PROCESSED_DIR / "user_genre_affinity.parquet")
+
+    # Build user->genre maps (top-level dict of dicts)
+    user_genre_map: Dict[int, Dict[str, float]] = {}
+    for u, g, aff, aff_d in user_genre.select(
+        "user_idx", "genre", "user_genre_aff", "user_genre_aff_decay"
+    ).iter_rows():
+        ud = user_genre_map.setdefault(int(u), {})
+        # store both in one packed float is messy; store main aff only here
+        ud[str(g)] = float(aff)
+
+    # Item->genres map
+    item_genres_map: Dict[int, List[str]] = {}
+    for i, g in item_genres.select("item_idx", "genre").iter_rows():
+        item_genres_map.setdefault(int(i), []).append(str(g))
+
+    # User feature map
     user_feat_map = {
         int(r[0]): {
             "user_interactions": float(r[1]),
@@ -87,6 +120,7 @@ def main() -> None:
         ).iter_rows()
     }
 
+    # Item feature map
     item_feat_map = {
         int(r[0]): {
             "item_interactions": float(r[1]),
@@ -103,23 +137,37 @@ def main() -> None:
         ).iter_rows()
     }
 
-    def feature_dict(u: int, i: int) -> Dict[str, float]:
-        ud = user_feat_map.get(u, {})
-        idd = item_feat_map.get(i, {})
+    # Item genre count map
+    item_genre_count_map = {
+        int(i): float(c)
+        for i, c in item_genre_count.select("item_idx", "item_genre_count").iter_rows()
+    }
 
-        # Merge with defaults
-        out = {
-            "user_interactions": 0.0,
-            "user_conf_sum": 0.0,
-            "user_conf_decay_sum": 0.0,
-            "user_days_since_last": 0.0,
-            "item_interactions": 0.0,
-            "item_conf_sum": 0.0,
-            "item_conf_decay_sum": 0.0,
-            "item_days_since_last": 0.0,
-        }
-        out.update(ud)
-        out.update(idd)
+    defaults = {
+        "user_interactions": 0.0,
+        "user_conf_sum": 0.0,
+        "user_conf_decay_sum": 0.0,
+        "user_days_since_last": 0.0,
+        "item_interactions": 0.0,
+        "item_conf_sum": 0.0,
+        "item_conf_decay_sum": 0.0,
+        "item_days_since_last": 0.0,
+        "item_genre_count": 0.0,
+        "user_item_genre_aff": 0.0,
+        "user_item_genre_aff_decay": 0.0,  # will remain 0 in this lightweight path
+    }
+
+    def feature_dict(u: int, i: int) -> Dict[str, float]:
+        out = dict(defaults)
+        out.update(user_feat_map.get(u, {}))
+        out.update(item_feat_map.get(i, {}))
+        out["item_genre_count"] = item_genre_count_map.get(i, 0.0)
+
+        genres = item_genres_map.get(i, [])
+        if genres:
+            ug = user_genre_map.get(u, {})
+            if ug:
+                out["user_item_genre_aff"] = sum(ug.get(g, 0.0) for g in genres) / len(genres)
         return out
 
     user_recs_ranked: Dict[int, List[int]] = {}
@@ -138,13 +186,12 @@ def main() -> None:
             user_recs_ranked[u] = []
             continue
 
-        # Build X in the exact saved order
         X = []
         for i in blended:
             fd = feature_dict(u, i)
-            X.append([fd[c] for c in feature_cols])
+            X.append([fd.get(c, 0.0) for c in feature_cols])
 
-        scores = model.predict_proba(X)[:, 1]
+        scores = model.predict_proba(X)[:, pos_idx]
         ranked = [i for i, _ in sorted(zip(blended, scores), key=lambda x: x[1], reverse=True)]
 
         user_recs_ranked[u] = ranked[:max_k]

@@ -1,0 +1,20 @@
+{
+  "feature_cols": [
+    "user_interactions",
+    "user_conf_sum",
+    "user_conf_decay_sum",
+    "user_days_since_last",
+    "item_interactions",
+    "item_conf_sum",
+    "item_conf_decay_sum",
+    "item_days_since_last",
+    "item_genre_count",
+    "user_item_genre_aff",
+    "user_item_genre_aff_decay"
+  ],
+  "positive_class": 1,
+  "classes_": [
+    0,
+    1
+  ]
+}
