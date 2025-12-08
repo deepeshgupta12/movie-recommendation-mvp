@@ -4,6 +4,7 @@ from typing import Dict, List, Set  # noqa: UP035
 
 import joblib
 import polars as pl
+from tqdm import tqdm
 
 from src.config.settings import settings
 from src.eval.metrics import aggregate_metrics
@@ -30,16 +31,22 @@ def build_truth(test_path: str) -> Dict[int, Set[int]]:
 
 def main() -> None:
     test_path = str(settings.PROCESSED_DIR / "test_conf.parquet")
+    if not (settings.PROCESSED_DIR / "train_conf.parquet").exists():
+        raise FileNotFoundError("train_conf.parquet not found. Run split_confidence first.")
+
+    print("[START] Building truth from test_conf...")
     truth = build_truth(test_path)
     users = list(truth.keys())
+    print(f"[OK] users_evaluated (raw): {len(users)}")
 
     ks = [10, 20, 50]
     max_k = max(ks)
 
-    # Candidate sources
+    print("[START] Fitting candidate models...")
     pop = PopularityRecommender().fit()
     item_item = ItemItemSimilarityRecommender().fit()
     als = ALSConfidenceRecommender().fit()
+    print("[OK] Candidate models ready.")
 
     blender = HybridCandidateBlender(
         sources=[
@@ -49,20 +56,23 @@ def main() -> None:
         ]
     )
 
-    # Load ranker
     ranker_path = settings.PROJECT_ROOT / "reports" / "models" / "ranker_hgb.pkl"
     if not ranker_path.exists():
         raise FileNotFoundError("Ranker model not found. Run train_ranker first.")
 
+    print("[START] Loading ranker...")
     model = joblib.load(ranker_path)
+    print("[OK] Ranker loaded.")
 
-    # Build feature lookups
+    print("[START] Building feature lookups from train_conf...")
     train_conf = pl.read_parquet(settings.PROCESSED_DIR / "train_conf.parquet").select(
         "user_idx", "item_idx", "confidence", "timestamp"
     )
+
     item_genres = build_item_genre_lookup()
     user_genre_aff = build_user_genre_affinity(train_conf, item_genres)
     pop_scores = build_popularity_scores(train_conf)
+    print("[OK] Feature lookups ready.")
 
     def item_features_for_user(u: int, i: int) -> List[float]:
         genres = item_genres.get(i, [])
@@ -72,8 +82,7 @@ def main() -> None:
         pop_conf = pop_scores.get(i, 0.0)
         genre_count = len(genres)
 
-        # pop_bucket derived from pop_conf rough binning
-        # simple deterministic bins for MVP
+        # Deterministic bins for MVP
         if pop_conf >= 5000:
             pop_bucket = 1
         elif pop_conf >= 1500:
@@ -87,7 +96,8 @@ def main() -> None:
 
     user_recs_ranked: Dict[int, List[int]] = {}
 
-    for u in users:
+    print("[START] Scoring and ranking candidates per user...")
+    for u in tqdm(users, desc="Ranking users"):
         cands_by_source = {
             "pop": pop.recommend(u, k=max_k),
             "item_item": item_item.recommend(u, k=max_k),
@@ -95,12 +105,11 @@ def main() -> None:
         }
         blended = blender.blend(cands_by_source, k=max_k)
 
-        # Score candidates with ranker
-        X = [item_features_for_user(u, i) for i in blended]
-        if not X:
+        if not blended:
             user_recs_ranked[u] = []
             continue
 
+        X = [item_features_for_user(u, i) for i in blended]
         scores = model.predict_proba(X)[:, 1]
         ranked = [i for i, _ in sorted(zip(blended, scores, strict=False), key=lambda x: x[1], reverse=True)]
 
