@@ -48,106 +48,60 @@ def _minmax_norm(vals: Dict[int, float]) -> Dict[int, float]:
     return {k: (float(v) - vmin) / (vmax - vmin) for k, v in vals.items()}
 
 
-def _ensure_list_col(df: pl.DataFrame, col: str) -> pl.DataFrame:
-    if col not in df.columns:
-        return df.with_columns(pl.lit([]).alias(col))
-    return df
-
-
 def main(
     out_k: int = 200,
     w_tt: float = 0.65,
     w_seq: float = 0.25,
     w_v2: float = 0.10,
 ):
-    print("\n[START] V3 val candidate blending...")
+    print("\n[START] V3 val candidate blending (ANN base + optional SEQ/V2)...")
 
-    # 1) Load sources
+    # Load
     print("[START] Loading input candidate files...")
-    ann = _load("ann_candidates_v3_val.parquet")
-    seq = _load("seq_candidates_v3_val.parquet")
-    v2 = _load("v2_candidates_val.parquet")
-
-    # Standardize required columns
-    ann = ann.select(["user_idx", "candidates", "tt_scores"])
-    seq = seq.select(["user_idx", "candidates", "seq_scores"])
-    v2 = v2.select(["user_idx", "candidates"])
+    ann = _load("ann_candidates_v3_val.parquet").select(["user_idx", "candidates", "tt_scores"])
+    seq = _load("seq_candidates_v3_val.parquet").select(["user_idx", "candidates", "seq_scores"])
+    v2 = _load("v2_candidates_val.parquet").select(["user_idx", "candidates"])
 
     print(f"[OK] ann users: {ann.height}")
     print(f"[OK] seq users: {seq.height}")
     print(f"[OK] v2 users:  {v2.height}")
 
-    # 2) Join: ANN + SEQ (inner)
-    print("[START] Joining ANN + SEQ on user_idx...")
-    df = ann.join(seq, on="user_idx", how="inner", suffix="_seq")
+    # IMPORTANT CHANGE:
+    # Use ANN as base and LEFT JOIN everything onto it
+    print("[START] Joining ANN + SEQ (LEFT)...")
+    df = ann.join(seq, on="user_idx", how="left", suffix="_seq")
     print(f"[OK] after ANN+SEQ join rows: {df.height}")
 
-    # 3) Join V2 prior (left)
-    print("[START] Joining V2 prior...")
+    print("[START] Joining V2 prior (LEFT)...")
     df = df.join(v2, on="user_idx", how="left", suffix="_v2")
     print(f"[OK] after +V2 join rows: {df.height}")
 
-    # Ensure expected column names exist
-    # After joins we expect:
-    # - candidates (ANN)
-    # - tt_scores
-    # - candidates_seq
-    # - seq_scores
-    # - candidates_v2 (optional)
-    if "candidates_seq" not in df.columns and "candidates" in seq.columns:
-        # fallback safety if suffix behavior differs in local Polars build
-        # Try to detect an alternate name
-        for c in df.columns:
-            if c.startswith("candidates") and c != "candidates":
-                # best effort
-                pass
-
-    df = _ensure_list_col(df, "candidates_v2")
+    # Fill missing lists safely
+    df = df.with_columns(
+        [
+            pl.col("candidates_seq").fill_null(pl.lit([])),
+            pl.col("seq_scores").fill_null(pl.lit([])),
+            pl.col("candidates_v2").fill_null(pl.lit([])),
+        ]
+    )
 
     print("[OK] columns in blend frame:")
     print(df.columns)
 
-    # 4) Blend
     print("[START] Blending per-user candidate pools...")
+
     out_users: List[int] = []
     out_items: List[List[int]] = []
     out_scores: List[List[float]] = []
     out_sources: List[List[str]] = []
 
-    # If join produced 0 rows, still write empty output
-    if df.height == 0:
-        print("[WARN] Zero users available for blending. Writing empty V3 parquet.")
-
-        out = pl.DataFrame(
-            {
-                "user_idx": [],
-                "candidates": [],
-                "blend_scores": [],
-                "blend_sources": [],
-            }
-        )
-        out_path = _p("v3_candidates_val.parquet")
-        out.write_parquet(out_path)
-
-        print("[DONE] V3 blended candidates saved (empty).")
-        print(f"[PATH] {out_path}")
-        print(f"[OK] weights: w_tt={w_tt}, w_seq={w_seq}, w_v2={w_v2}")
-        return
-
-    # Build a quick set cache for V2 list membership
     for row in df.iter_rows(named=True):
         u = int(row["user_idx"])
 
         ann_items = row.get("candidates") or []
         ann_scores = row.get("tt_scores") or []
 
-        # Polars suffix behavior safety
-        seq_items = row.get("candidates_seq", None)
-        if seq_items is None:
-            # fallback: try to locate any candidates-like column from seq
-            seq_items = row.get("candidates_right", []) or []
-        seq_items = seq_items or []
-
+        seq_items = row.get("candidates_seq") or []
         seq_scores = row.get("seq_scores") or []
 
         v2_items = row.get("candidates_v2") or []
