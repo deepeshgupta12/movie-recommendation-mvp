@@ -277,10 +277,14 @@ def main():
         st.rerun()
 
     if go:
+        # IMPORTANT:
+        # API enforces k <= 50. We fetch a slightly larger pool than display-k
+        # but never exceed 50 to stay compliant with validation.
+        fetch_k = min(50, max(int(k), 30))
+
         with st.spinner("Building Home rows..."):
             t0 = time.perf_counter()
-            # Fetch a larger pool once, reuse for all rows
-            recs = fetch_recommendations_cached(base_url, int(user_idx), int(max(k, 60)))
+            recs = fetch_recommendations_cached(base_url, int(user_idx), fetch_k)
             t1 = time.perf_counter()
 
         if apply_live_boost:
