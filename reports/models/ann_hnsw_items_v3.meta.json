@@ -1,0 +1,11 @@
+{
+  "index_path": "reports/models/ann_hnsw_items_v3.bin",
+  "meta_path": "reports/models/ann_hnsw_items_v3.meta.json",
+  "space": "ip",
+  "dim": 64,
+  "num_items": 26582,
+  "M": 48,
+  "ef_construction": 200,
+  "ef_default": 100,
+  "item_embedding_source": "/Users/deepeshgupta/Projects/movie-recommendation-mvp/data/processed/item_emb_v3.parquet"
+}

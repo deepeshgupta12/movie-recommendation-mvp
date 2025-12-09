@@ -1,0 +1,14 @@
+{
+  "model_path": "reports/models/two_tower_v3.pt",
+  "embed_dim": 64,
+  "num_users": 138493,
+  "num_items": 26742,
+  "batch_size": 2048,
+  "epochs": 2,
+  "lr": 0.001,
+  "num_negatives": 10,
+  "max_pos_per_user": 50,
+  "seed": 42,
+  "device_trained": "mps",
+  "reports_dir_resolved": "reports"
+}

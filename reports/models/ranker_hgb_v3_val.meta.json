@@ -1,0 +1,22 @@
+{
+  "model": "HistGradientBoostingClassifier",
+  "features_locked_order": [
+    "blend_score",
+    "has_tt",
+    "has_seq",
+    "has_v2",
+    "user_interactions",
+    "user_conf_sum",
+    "user_conf_decay_sum",
+    "user_days_since_last",
+    "item_interactions",
+    "item_conf_sum",
+    "item_conf_decay_sum",
+    "item_days_since_last"
+  ],
+  "auc_val_pointwise": 0.799754079730324,
+  "train_rows": 8000000,
+  "val_rows": 2000000,
+  "random_state": 42,
+  "notes": "V3 ranker trained on V3 blended VAL candidates with V2 feature store + source flags."
+}
