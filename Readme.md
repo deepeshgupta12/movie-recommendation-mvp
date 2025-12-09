@@ -1,4 +1,4 @@
-# 🎬 Movie Recommendation MVP (V2)
+# 🎬 Movie Recommendation Engine
 
 A serious, production-style **Movie Recommendation System MVP** built on the **MovieLens 20M** dataset.  
 This project implements a modern **multi-stage recommender** inspired by real-world patterns used by platforms like Netflix and Amazon Prime—adapted for **local-first execution on Apple Silicon (M1)**.
