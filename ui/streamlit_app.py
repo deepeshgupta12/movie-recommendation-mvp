@@ -40,7 +40,17 @@ def fetch_health(base_url: str) -> bool:
 
 
 @st.cache_data(show_spinner=False, ttl=60)
-def fetch_recommendations_cached(base_url: str, user_idx: int, k: int) -> List[Dict[str, Any]]:
+def fetch_recommendations_cached(
+    base_url: str,
+    user_idx: int,
+    k: int,
+    refresh_token: int,
+) -> List[Dict[str, Any]]:
+    """
+    refresh_token is intentionally part of the cache key
+    to allow controlled cache busting from the UI.
+    """
+    _ = refresh_token  # used only to vary cache key
     r = _api_get(f"/recommend/user/{user_idx}", base_url, params={"k": k})
     if r.status_code != 200:
         raise RuntimeError(f"API error ({r.status_code}): {r.text}")
@@ -150,12 +160,48 @@ def render_row_title(title: str, subtitle: str = ""):
         st.write("")
 
 
+def _repair_and_filter_metadata(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Ensures UI never displays empty-title cards.
+    Tries to repair missing title/genres using local lookup.
+    Drops items that still don't have a title.
+    """
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        new_it = dict(it)
+        item_idx = new_it.get("item_idx", None)
+
+        title = str(new_it.get("title", "") or "").strip()
+        genres = str(new_it.get("genres", "") or "").strip()
+
+        if (not title or not genres) and item_idx is not None:
+            try:
+                t, g = get_title_genres(int(item_idx))
+                if not title:
+                    title = str(t or "").strip()
+                if not genres:
+                    genres = str(g or "").strip()
+            except Exception:
+                pass
+
+        if not title:
+            continue
+
+        new_it["title"] = title
+        new_it["genres"] = genres
+        out.append(new_it)
+
+    return out
+
+
 def render_horizontal_cards(
     items: List[Dict[str, Any]],
     user_idx: int,
     poster_map: Dict[int, str],
     row_key: str,
 ):
+    items = _repair_and_filter_metadata(items)
+
     if not items:
         st.info("No items available for this row yet.")
         return
@@ -263,6 +309,9 @@ def main():
     style()
     st.title("Movie Recommendation MVP — Home")
 
+    if "refresh_token" not in st.session_state:
+        st.session_state["refresh_token"] = 0
+
     poster_map = load_poster_cache()
 
     with st.sidebar:
@@ -304,11 +353,19 @@ def main():
         else:
             st.warning("API not reachable. Start FastAPI.")
 
-    cta1, cta2, _ = st.columns([1, 1, 2])
-    with cta1:
+    c1, c2, c3, _ = st.columns([1, 1, 1, 2])
+    with c1:
         go = st.button("Load Home", type="primary", use_container_width=True)
-    with cta2:
+    with c2:
+        refresh = st.button("Refresh Home", use_container_width=True)
+    with c3:
         clear = st.button("Clear", use_container_width=True)
+
+    if refresh:
+        st.session_state["refresh_token"] += 1
+        st.session_state.pop("recs", None)
+        st.session_state.pop("lat_ms", None)
+        st.rerun()
 
     if clear:
         st.session_state.pop("recs", None)
@@ -317,13 +374,12 @@ def main():
 
     if go:
         # API enforces k <= 50.
-        # We fetch a slightly larger pool than display-k for diversity,
-        # but never exceed the API ceiling.
         fetch_k = min(50, max(int(k), 30))
+        token = int(st.session_state["refresh_token"])
 
         with st.spinner("Building Home rows..."):
             t0 = time.perf_counter()
-            recs = fetch_recommendations_cached(base_url, int(user_idx), fetch_k)
+            recs = fetch_recommendations_cached(base_url, int(user_idx), fetch_k, token)
             t1 = time.perf_counter()
 
         if apply_live_boost:
@@ -363,6 +419,8 @@ def main():
 
     # Row 2: Top Picks For You
     top_pool = recs[: max(int(k) * 3, 30)]
+    top_pool = _repair_and_filter_metadata(top_pool)
+
     if enable_diversity:
         top_picks = apply_diversity_pipeline(
             items=top_pool,
@@ -375,6 +433,9 @@ def main():
     else:
         top_picks = top_pool[: int(k)]
 
+    # Repair again post-diversity (safe guard)
+    top_picks = _repair_and_filter_metadata(top_picks)
+
     render_row_title("Top Picks For You", "V2 ranked hybrid output plus optional diversity re-rank")
     render_horizontal_cards(top_picks, int(user_idx), poster_map, row_key="top_picks")
 
@@ -382,6 +443,8 @@ def main():
 
     # Row 3: Because You Watched
     because_pool = build_because_you_watched_row(int(user_idx), recs)
+    because_pool = _repair_and_filter_metadata(because_pool)
+
     if enable_diversity and because_pool:
         because_row = apply_diversity_pipeline(
             items=because_pool,
@@ -394,6 +457,8 @@ def main():
     else:
         because_row = because_pool[:10]
 
+    because_row = _repair_and_filter_metadata(because_row)
+
     render_row_title("Because You Watched", "Derived from your last watch event")
     render_horizontal_cards(because_row, int(user_idx), poster_map, row_key="because")
 
@@ -401,6 +466,8 @@ def main():
 
     # Row 4: Trending Now
     trending_pool = get_trending_items(limit=24)
+    trending_pool = _repair_and_filter_metadata(trending_pool)
+
     if enable_diversity and trending_pool:
         trending = apply_diversity_pipeline(
             items=trending_pool,
@@ -413,10 +480,12 @@ def main():
     else:
         trending = trending_pool[:10]
 
+    trending = _repair_and_filter_metadata(trending)
+
     render_row_title("Trending Now", "Derived locally from item interaction features")
     render_horizontal_cards(trending, int(user_idx), poster_map, row_key="trending")
 
-    st.caption("Step 7.5 closed: UI slate diversity + polished poster fallback.")
+    st.caption("Step 7.5 closed: slate diversity, stable metadata, and controlled refresh.")
 
 
 if __name__ == "__main__":
