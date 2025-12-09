@@ -25,22 +25,28 @@ def _load(name: str) -> pl.DataFrame:
 
 
 def _load_model():
+    import json
+
     import joblib
+
     model_path = MODELS_DIR / "ranker_hgb_v3_val.pkl"
     meta_path = MODELS_DIR / "ranker_hgb_v3_val.meta.json"
+
     if not model_path.exists():
         raise FileNotFoundError(f"Missing model: {model_path}")
     if not meta_path.exists():
         raise FileNotFoundError(f"Missing meta: {meta_path}")
 
-    meta = __import__("json").loads(meta_path.read_text())
+    meta = json.loads(meta_path.read_text())
     clf = joblib.load(model_path)
     feature_cols = meta["features_locked_order"]
     return clf, feature_cols, meta
 
 
 def _build_truth_map(val_conf: pl.DataFrame) -> Dict[int, set]:
-    grouped = val_conf.group_by("user_idx").agg(pl.col("item_idx").unique().alias("items"))
+    grouped = val_conf.group_by("user_idx").agg(
+        pl.col("item_idx").unique().alias("items")
+    )
     out: Dict[int, set] = {}
     for row in grouped.iter_rows(named=True):
         out[int(row["user_idx"])] = set(int(x) for x in (row["items"] or []))
@@ -54,7 +60,7 @@ def _ndcg_at_k(recs: List[int], truth: set, k: int) -> float:
     for idx, item in enumerate(recs[:k]):
         if item in truth:
             dcg += 1.0 / np.log2(idx + 2)
-    # ideal dcg
+
     ideal_hits = min(len(truth), k)
     idcg = sum(1.0 / np.log2(i + 2) for i in range(ideal_hits))
     return float(dcg / idcg) if idcg > 0 else 0.0
@@ -77,7 +83,6 @@ def main():
     val_conf = _load("val_conf.parquet").select(["user_idx", "item_idx"])
 
     clf, feature_cols, meta = _load_model()
-
     truth_map = _build_truth_map(val_conf)
 
     print(f"[OK] V3 candidate users: {v3.height}")
@@ -88,8 +93,7 @@ def main():
     base = v3.select(["user_idx", "candidates", "blend_scores", "blend_sources"])
 
     exploded = (
-        base
-        .with_columns(
+        base.with_columns(
             [
                 pl.col("candidates").list.head(200).alias("cand_cut"),
                 pl.col("blend_scores").list.head(200).alias("bs_cut"),
@@ -107,8 +111,8 @@ def main():
         )
     )
 
-    # Source flags (cheap python parse)
-    src_py = exploded.select(["blend_source_raw"]).to_series().to_list()
+    # ✅ FIX: correct way to get python list from a column
+    src_py = exploded.get_column("blend_source_raw").to_list()
 
     def parse_src(x):
         s = ",".join(x) if isinstance(x, list) else str(x)
@@ -119,6 +123,7 @@ def main():
         )
 
     flags = [parse_src(x) for x in src_py]
+
     exploded = exploded.with_columns(
         [
             pl.Series("has_tt", [f[0] for f in flags], dtype=pl.Int8),
@@ -129,19 +134,18 @@ def main():
 
     # Join features
     feat = (
-        exploded
-        .join(user_feat, on="user_idx", how="left")
+        exploded.join(user_feat, on="user_idx", how="left")
         .join(item_feat, on="item_idx", how="left")
     )
 
-    # Fill missing numeric
-    for c in feat.columns:
-        if c in ("blend_source_raw",):
+    # Fill missing numeric values
+    for c, dt in zip(feat.columns, feat.dtypes):
+        if c == "blend_source_raw":
             continue
-        if feat[c].dtype in (
+        if dt in (
             pl.Int8, pl.Int16, pl.Int32, pl.Int64,
             pl.UInt32, pl.UInt64,
-            pl.Float32, pl.Float64
+            pl.Float32, pl.Float64,
         ):
             feat = feat.with_columns(pl.col(c).fill_null(0))
 
@@ -150,14 +154,15 @@ def main():
     scores = clf.predict_proba(X)[:, 1]
     feat = feat.with_columns(pl.Series("rank_score", scores))
 
-    # Re-aggregate to ranked lists
+    # Re-aggregate ranked list per user
+    # ✅ FIX: correct Polars list aggregation pattern
     ranked = (
         feat.sort(["user_idx", "rank_score"], descending=[False, True])
         .group_by("user_idx")
-        .agg(pl.col("item_idx").list().alias("ranked_items"))
+        .agg(pl.col("item_idx").alias("ranked_items"))
     )
 
-    # Compute metrics
+    # Metrics
     ks = [10, 20, 50, 100, 200]
     recalls = {k: [] for k in ks}
     ndcgs = {k: [] for k in ks}
