@@ -1,3 +1,47 @@
+[project]
+name = "movie-recommendation-mvp"
+version = "0.1.0"
+description = "Local-first movie recommendation system MVP (V1-V3)"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+  # Core data/compute
+  "polars>=1.0.0",
+  "duckdb>=1.0.0",
+  "numpy>=1.26.0",
+  "scipy>=1.11.0",
+  "scikit-learn>=1.4.0",
+  "pyarrow>=15.0.0",
+
+  # Recommenders
+  "implicit>=0.7.2",
+
+  # API
+  "fastapi>=0.111.0",
+  "uvicorn>=0.30.0",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.3.0",
+
+  # UI + HTTP
+  "streamlit>=1.36.0",
+  "requests>=2.31.0",
+
+  # Utilities
+  "tqdm>=4.66.0",
+
+  # V3 Neural + ANN (Apple Silicon-friendly)
+  "torch>=2.3.0",
+  "hnswlib>=0.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.5.0",
+  "mypy>=1.10.0",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -13,7 +57,3 @@ ignore_missing_imports = true
 warn_return_any = true
 warn_unused_ignores = true
 disallow_untyped_defs = false
-
-torch = ">=2.3"
-hnswlib = ">=0.8.0"
-tqdm= "^=4.66"
