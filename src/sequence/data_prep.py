@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple  # noqa: UP035
+from typing import List, Tuple  # noqa: UP035
 
 import polars as pl
 
@@ -20,19 +20,13 @@ def _load_conf_splits() -> tuple[pl.DataFrame, pl.DataFrame]:
     val = pl.read_parquet(val_path)
 
     # Normalize column names
-    rename_map = {}
     cols = set(train.columns)
     if "timestamp" in cols and "ts" not in cols:
-        rename_map["timestamp"] = "ts"
-    if rename_map:
-        train = train.rename(rename_map)
+        train = train.rename({"timestamp": "ts"})
 
-    rename_map_v = {}
     cols_v = set(val.columns)
     if "timestamp" in cols_v and "ts" not in cols_v:
-        rename_map_v["timestamp"] = "ts"
-    if rename_map_v:
-        val = val.rename(rename_map_v)
+        val = val.rename({"timestamp": "ts"})
 
     if "ts" not in train.columns:
         train = train.with_columns(pl.lit(0).alias("ts"))
@@ -67,14 +61,23 @@ def _build_last_item_examples(
     Builds one example per user:
       seq = previous items (up to max_seq_len)
       target = last item
+
+    Output:
+      - user_idx
+      - seq (list[int32])
+      - target (int32)
     """
+
     grouped = (
         df.sort(["user_idx", "ts"])
         .group_by("user_idx")
-        .agg(pl.col("item_idx").list().alias("items"))
+        .agg(pl.col("item_idx").implode().alias("items"))
+        .with_columns(
+            # enforce stable list dtype early
+            pl.col("items").cast(pl.List(pl.Int32))
+        )
     )
 
-    # Build seq + target
     def cut_seq(items: List[int]) -> List[int]:
         if items is None or len(items) <= 1:
             return []
@@ -88,11 +91,20 @@ def _build_last_item_examples(
             return -1
         return int(items[-1])
 
-    out = grouped.with_columns(
-        pl.col("items").map_elements(cut_seq).alias("seq"),
-        pl.col("items").map_elements(get_target).alias("target"),
-        pl.col("items").list.len().alias("len_items"),
-    ).drop("items")
+    out = (
+        grouped.with_columns(
+            pl.col("items").map_elements(
+                cut_seq,
+                return_dtype=pl.List(pl.Int32),
+            ).alias("seq"),
+            pl.col("items").map_elements(
+                get_target,
+                return_dtype=pl.Int32,
+            ).alias("target"),
+            pl.col("items").list.len().alias("len_items"),
+        )
+        .drop("items")
+    )
 
     out = out.filter((pl.col("len_items") >= 2) & (pl.col("target") >= 0)).drop("len_items")
     return out
@@ -114,8 +126,8 @@ def build_sequence_datasets(
 
     Output schema:
       - user_idx
-      - seq (list[int])
-      - target (int)
+      - seq (list[int32])
+      - target (int32)
     """
 
     print("\n[START] Loading confidence splits for Sequences...")
@@ -134,19 +146,20 @@ def build_sequence_datasets(
     train_examples = _build_last_item_examples(train_u, max_seq_len=max_seq_len)
     print(f"[OK] train sequence rows: {train_examples.height}")
 
-    # Validation logic:
-    # Build context from train_u, then set target from val_u if available.
+    # Validation:
     print("[START] Building per-user val sequences with train context...")
+
     train_group = (
         train_u.sort(["user_idx", "ts"])
         .group_by("user_idx")
-        .agg(pl.col("item_idx").list().alias("train_items"))
+        .agg(pl.col("item_idx").implode().alias("train_items"))
+        .with_columns(pl.col("train_items").cast(pl.List(pl.Int32)))
     )
 
     val_last = (
         val_u.sort(["user_idx", "ts"])
         .group_by("user_idx")
-        .agg(pl.col("item_idx").last().alias("val_target"))
+        .agg(pl.col("item_idx").last().cast(pl.Int32).alias("val_target"))
     )
 
     merged = train_group.join(val_last, on="user_idx", how="inner")
@@ -159,11 +172,17 @@ def build_sequence_datasets(
             seq = seq[-max_seq_len:]
         return seq
 
-    val_examples = merged.with_columns(
-        pl.col("train_items").map_elements(build_val_seq).alias("seq"),
-        pl.col("val_target").cast(pl.Int32).alias("target"),
-        pl.col("train_items").list.len().alias("len_items"),
-    ).drop("train_items")
+    val_examples = (
+        merged.with_columns(
+            pl.col("train_items").map_elements(
+                build_val_seq,
+                return_dtype=pl.List(pl.Int32),
+            ).alias("seq"),
+            pl.col("val_target").cast(pl.Int32).alias("target"),
+            pl.col("train_items").list.len().alias("len_items"),
+        )
+        .drop("train_items")
+    )
 
     val_examples = val_examples.filter(pl.col("len_items") >= 1).drop("len_items")
     print(f"[OK] val sequence rows: {val_examples.height}")
