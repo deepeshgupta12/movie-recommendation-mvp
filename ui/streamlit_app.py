@@ -13,6 +13,7 @@ from ui.home_rows import (
     get_title_genres,
     get_trending_items,
 )
+from ui.poster_renderer import render_poster_or_placeholder
 from ui.realtime_rerank import apply_feedback_rerank, get_user_liked_genres
 from ui.session_store import (
     get_continue_watching_items,
@@ -79,23 +80,59 @@ def style():
         """
         <style>
         .block-container { padding-top: 1.0rem; padding-bottom: 2rem; }
-        .muted { color: rgba(0,0,0,0.55); font-size: 0.9rem; }
+
         .pill {
             display: inline-block;
             padding: 2px 8px;
             border-radius: 999px;
             margin-right: 6px;
             margin-bottom: 6px;
-            background: rgba(0,0,0,0.06);
-            font-size: 0.8rem;
+            background: rgba(255,255,255,0.07);
+            font-size: 0.78rem;
         }
+
         .score-box {
-            background: rgba(0,0,0,0.03);
+            background: rgba(255,255,255,0.06);
             padding: 6px 10px;
             border-radius: 10px;
             display: inline-block;
             font-weight: 600;
-            font-size: 0.95rem;
+            font-size: 0.92rem;
+        }
+
+        /* Poster placeholder */
+        .ph-card {
+            border-radius: 14px;
+            padding: 14px;
+            background:
+                radial-gradient(1200px 500px at 20% 10%, rgba(255,255,255,0.08), transparent),
+                linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
+            border: 1px solid rgba(255,255,255,0.08);
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+        }
+        .ph-badge {
+            font-size: 0.7rem;
+            opacity: 0.7;
+            margin-bottom: auto;
+        }
+        .ph-title {
+            font-weight: 700;
+            font-size: 1.0rem;
+            line-height: 1.2;
+            margin-top: 8px;
+        }
+        .ph-genres {
+            margin-top: 8px;
+        }
+        .ph-chip {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.08);
+            font-size: 0.72rem;
+            margin-right: 6px;
         }
         </style>
         """,
@@ -133,10 +170,13 @@ def render_horizontal_cards(
 
         with cols[i]:
             poster = poster_map.get(item_idx)
-            if poster:
-                st.image(poster, use_container_width=True)
-            else:
-                st.caption("No poster")
+
+            render_poster_or_placeholder(
+                poster_url=poster,
+                title=title,
+                genres=genres,
+                height=220,
+            )
 
             st.markdown(f"**{title}**")
             st.caption(genres)
@@ -232,7 +272,6 @@ def main():
         k = st.slider("Top-K (Top Picks)", min_value=5, max_value=50, value=10, step=5)
 
         auto_health = st.checkbox("Check API health", value=True)
-        show_posters = st.checkbox("Show posters", value=True)
 
         st.divider()
         st.header("Real-time personalization")
@@ -277,9 +316,9 @@ def main():
         st.rerun()
 
     if go:
-        # IMPORTANT:
-        # API enforces k <= 50. We fetch a slightly larger pool than display-k
-        # but never exceed 50 to stay compliant with validation.
+        # API enforces k <= 50.
+        # We fetch a slightly larger pool than display-k for diversity,
+        # but never exceed the API ceiling.
         fetch_k = min(50, max(int(k), 30))
 
         with st.spinner("Building Home rows..."):
@@ -377,7 +416,7 @@ def main():
     render_row_title("Trending Now", "Derived locally from item interaction features")
     render_horizontal_cards(trending, int(user_idx), poster_map, row_key="trending")
 
-    st.caption("Step 7.5 adds UI-level slate diversity without changing the model layer.")
+    st.caption("Step 7.5 closed: UI slate diversity + polished poster fallback.")
 
 
 if __name__ == "__main__":
