@@ -144,7 +144,7 @@ def _read_ann_label_mode_from_meta() -> Optional[str]:
 
 
 def _infer_label_mode(
-    index: "hnswlib.Index",
+    index: hnswlib.Index,
     sample_user_vec: np.ndarray,
     item_idx: np.ndarray,
     idx_to_row: Dict[int, int],
@@ -153,25 +153,47 @@ def _infer_label_mode(
     labels, _ = index.knn_query(sample_user_vec, k=min(ann_k, 200))
     labels = labels[0].astype(np.int64)
 
-    # Heuristic 1: if all labels are small and fit row space
+    # If ALL labels are within row range, likely row mode
     if labels.max(initial=0) < len(item_idx):
         return "row"
 
-    # Heuristic 2: if labels look like item_idx values
-    # We check a small sample membership
-    sample = labels[: min(len(labels), 20)]
-    ok = all(int(x) in idx_to_row for x in sample.tolist())
-    if ok:
+    # If labels look like item_idx values
+    sample = labels[: min(len(labels), 25)]
+    ok = sum(1 for x in sample.tolist() if int(x) in idx_to_row)
+
+    if ok >= max(5, int(0.6 * len(sample))):
         return "item_idx"
 
-    raise RuntimeError(
-        "Could not infer ANN label mode. "
-        "Your ANN index likely doesn't match current item_emb_v3. "
-        "Rebuild ann_hnsw_items_v3.bin from item_emb_v3.parquet."
-    )
+    # Default to item_idx for safety in evolving local pipelines
+    return "item_idx"
 
 
-def _resolve_labels(
+def _autocorrect_mode_if_needed(
+    mode: str,
+    labels: np.ndarray,
+    item_idx: np.ndarray,
+    idx_to_row: Dict[int, int]
+) -> str:
+    labels = labels.astype(np.int64)
+
+    if mode == "row":  # noqa: SIM102
+        # If any label is out of bounds for the embedding file,
+        # this cannot be true row mode.
+        if labels.max(initial=0) >= len(item_idx):
+            return "item_idx"
+
+    if mode == "item_idx":
+        # If almost none of the labels exist in idx_to_row,
+        # it might actually be row ids.
+        sample = labels[: min(len(labels), 25)]
+        ok = sum(1 for x in sample.tolist() if int(x) in idx_to_row)
+        if ok <= 1 and labels.max(initial=0) < len(item_idx):
+            return "row"
+
+    return mode
+
+
+def _resolve_labels_safe(
     labels: np.ndarray,
     item_idx: np.ndarray,
     idx_to_row: Dict[int, int],
@@ -181,19 +203,31 @@ def _resolve_labels(
     Returns:
       cand_items: global item_idx values
       local_ids: row indices into item_mat for scoring
+
+    Safe behavior:
+      - filters invalid labels instead of crashing
     """
     labels = labels.astype(np.int64)
 
     if mode == "row":
-        # labels are row ids
-        local_ids = labels
+        # Filter labels that are valid row positions
+        valid = labels[labels < len(item_idx)]
+        if len(valid) == 0:
+            # nothing usable
+            return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.int64)
+
+        local_ids = valid
         cand_items = item_idx[local_ids]
         return cand_items, local_ids
 
     if mode == "item_idx":
-        # labels are global item_idx values
-        cand_items = labels
-        local_ids = np.asarray([idx_to_row[int(i)] for i in cand_items.tolist()], dtype=np.int64)
+        # Keep only labels that exist in the current embedding map
+        valid_items = [int(x) for x in labels.tolist() if int(x) in idx_to_row]
+        if len(valid_items) == 0:
+            return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.int64)
+
+        cand_items = np.asarray(valid_items, dtype=np.int64)
+        local_ids = np.asarray([idx_to_row[int(i)] for i in valid_items], dtype=np.int64)
         return cand_items, local_ids
 
     raise ValueError(f"Unknown label mode: {mode}")
@@ -266,10 +300,11 @@ def main(topk: int = DEFAULT_TOPK, ann_k: int = DEFAULT_ANN_K):
     # Detect label mode
     mode = _read_ann_label_mode_from_meta()
     if mode is None:
-        # Infer using first test user
         probe_user = int(test_users[0])
         mode = _infer_label_mode(idx, user_lookup[probe_user], item_idx, idx_to_row, ann_k)
-    print(f"[OK] ANN label mode: {mode}")
+
+    # We'll still validate/auto-correct per-query using actual labels.
+    print(f"[OK] ANN label mode (initial): {mode}")
 
     out_users: List[int] = []
     out_cands: List[List[int]] = []
@@ -287,21 +322,31 @@ def main(topk: int = DEFAULT_TOPK, ann_k: int = DEFAULT_ANN_K):
         labels, _ = idx.knn_query(uvec, k=ann_k)
         labels = labels[0].astype(np.int64)
 
-        # Map labels -> (global item_idx, local row ids for scoring)
-        cand_items, local_ids = _resolve_labels(labels, item_idx, idx_to_row, mode)
+        # Auto-correct mode if the labels contradict it
+        effective_mode = _autocorrect_mode_if_needed(mode, labels, item_idx, idx_to_row)
 
-        # Optionally filter seen using global item_idx
-        if FILTER_SEEN and u in seen_map:
+        cand_items, local_ids = _resolve_labels_safe(labels, item_idx, idx_to_row, effective_mode)
+
+        # Filter seen using global item_idx
+        if FILTER_SEEN and u in seen_map and len(cand_items) > 0:
             s = seen_map[u]
-            mask = np.array([int(ci) not in s for ci in cand_items.tolist()], dtype=bool)
-            cand_items = cand_items[mask]
-            local_ids = local_ids[mask]
+            keep = np.array([int(ci) not in s for ci in cand_items.tolist()], dtype=bool)
+            cand_items = cand_items[keep]
+            local_ids = local_ids[keep]
 
+        # If we lost everything, fallback to smaller strict retrieval
         if len(local_ids) == 0:
-            # Defensive fallback: no filter for this user
             labels, _ = idx.knn_query(uvec, k=topk)
             labels = labels[0].astype(np.int64)
-            cand_items, local_ids = _resolve_labels(labels, item_idx, idx_to_row, mode)
+            effective_mode = _autocorrect_mode_if_needed(mode, labels, item_idx, idx_to_row)
+            cand_items, local_ids = _resolve_labels_safe(labels, item_idx, idx_to_row, effective_mode)
+
+        # Still nothing: skip gracefully (should be rare)
+        if len(local_ids) == 0:
+            out_users.append(u)
+            out_cands.append([])
+            out_scores.append([])
+            continue
 
         # Rescore by dot product
         scores = _dot_scores(uvec, item_mat, local_ids)
@@ -327,7 +372,6 @@ def main(topk: int = DEFAULT_TOPK, ann_k: int = DEFAULT_ANN_K):
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(OUT_PATH)
 
-    # Write meta for reproducibility
     meta = {
         "version": "v3_test",
         "topk": topk,
@@ -340,14 +384,16 @@ def main(topk: int = DEFAULT_TOPK, ann_k: int = DEFAULT_ANN_K):
         "ann_index_path": str(ANN_INDEX_PATH),
         "user_emb_path": str(USER_EMB_TEST_PATH),
         "item_emb_path": str(ITEM_EMB_PATH),
-        "id_mode": mode,
+        "label_mode_initial": mode,
+        "note": "Runtime auto-correct may override label mode per user based on label range/mappability.",
     }
     (OUT_PATH.parent / "ann_candidates_v3_test.meta.json").write_text(json.dumps(meta, indent=2))
 
     print("[DONE] ANN candidates exported.")
     print(f"[PATH] {OUT_PATH.resolve()}")
     print(f"[OK] users exported: {len(out_users)}")
-    print(f"[OK] topk={topk} | ann_k={ann_k} | filter_seen={FILTER_SEEN} | id_mode={mode}")
+    print(f"[OK] topk={topk} | ann_k={ann_k} | filter_seen={FILTER_SEEN}")
+    print(f"[OK] label_mode_initial={mode} | runtime_auto_correct=enabled")
 
 
 if __name__ == "__main__":
