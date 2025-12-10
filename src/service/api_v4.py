@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: UP035
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# Service imports
-# We assume these exist based on your V4 work so far.
 from src.service.reco_service_v4 import V4RecommenderService, V4ServiceConfig
 
 app = FastAPI(title="Movie Recommendation API", version="v4")
 
 
 # -----------------------------
-# Response / Request Models
+# Models (lightweight, no strict route validation)
 # -----------------------------
 
 class HealthResponse(BaseModel):
@@ -23,108 +22,63 @@ class HealthResponse(BaseModel):
     version: str = "v4"
 
 
-class RecommendItem(BaseModel):
-    item_idx: int
-    movieId: Optional[int] = None
-    title: Optional[str] = None
-    poster_url: Optional[str] = None
-
-    score: float = 0.0
-    reason: Optional[str] = None
-
-    # explainability + session flags
-    has_tt: int = 0
-    has_seq: int = 0
-    has_v2: int = 0
-
-    short_term_boost: float = 0.0
-    sess_hot: int = 0
-    sess_warm: int = 0
-    sess_cold: int = 0
-
-
-class RecommendDebug(BaseModel):
-    split: str
-    project_root: Optional[str] = None
-    candidates_path: Optional[str] = None
-    session_features_path: Optional[str] = None
-    ranker_path: Optional[str] = None
-    ranker_meta_path: Optional[str] = None
-    model_auc: Optional[float] = None
-    feature_order: Optional[List[str]] = None
-    candidate_count: Optional[int] = None
-    extra: Dict[str, Any] = Field(default_factory=dict)
-
-
-class RecommendResponse(BaseModel):
-    user_idx: int
-    k: int
-    split: str
-    recommendations: List[RecommendItem]
-    debug: Optional[RecommendDebug] = None
-
-
 class FeedbackEvent(BaseModel):
     user_idx: int
     item_idx: int
     event: str = Field(..., description="like | watched | watch_later | start | dislike etc.")
-    ts: Optional[int] = Field(None, description="optional unix ts")
-
-
-class FeedbackResponse(BaseModel):
-    status: str = "ok"
-    version: str = "v4"
+    ts: Optional[int] = None
 
 
 # -----------------------------
-# Service Factory
+# Service factory
 # -----------------------------
-
-@dataclass(frozen=True)
-class _SvcKey:
-    split: str
-
 
 @lru_cache(maxsize=4)
-def _get_service_cached(split: str) -> V4RecommenderService:
+def _svc(split: str) -> V4RecommenderService:
     cfg = V4ServiceConfig(split=split)
     return V4RecommenderService(cfg)
 
 
-def get_service(split: str) -> V4RecommenderService:
-    split = (split or "val").lower().strip()
-    if split not in {"val", "test"}:
-        raise HTTPException(status_code=400, detail=f"Invalid split: {split}")
-    return _get_service_cached(split)
+def _normalize_split(split: str) -> str:
+    s = (split or "val").lower().strip()
+    return s if s in {"val", "test"} else "val"
 
 
 # -----------------------------
 # Routes
 # -----------------------------
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 def health() -> HealthResponse:
     return HealthResponse()
 
 
-@app.get("/recommend", response_model=RecommendResponse)
+@app.get("/recommend")
 def recommend(
     user_idx: int = Query(..., ge=0),
     k: int = Query(20, ge=1, le=200),
     include_titles: bool = Query(True),
     debug: bool = Query(False),
     split: str = Query("val"),
-) -> RecommendResponse:
+):
     """
-    V4 recommendations using:
-    - V3 blended candidates
-    - V4 session features
-    - V4 ranker
-    - Lightweight explanation reasons
-    - Poster resolution from cache-first pipeline (handled inside service)
+    V4 recommend endpoint.
+    We intentionally avoid FastAPI response_model here to prevent any
+    response validation edge-case from killing the reload worker and causing
+    RemoteDisconnected.
+
+    The service is expected to return:
+      {
+        "items": [...],
+        "debug": {...},
+        "split": "val"
+      }
+    or equivalently "recommendations" instead of "items".
     """
+    split = _normalize_split(split)
+
     try:
-        svc = get_service(split)
+        svc = _svc(split)
 
         out = svc.recommend(
             user_idx=user_idx,
@@ -133,80 +87,77 @@ def recommend(
             debug=debug,
         )
 
-        # We expect service to return a dict-like payload.
-        # Normalize into API response safely.
+        if not isinstance(out, dict):
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "Service returned non-dict payload",
+                    "type": str(type(out)),
+                    "split": split,
+                },
+            )
 
-        items = out.get("items") or out.get("recommendations") or []
+        items = out.get("items")
+        if items is None:
+            items = out.get("recommendations", [])
+
         if not isinstance(items, list):
-            raise RuntimeError("Service returned invalid items shape.")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "Service returned invalid items shape",
+                    "items_type": str(type(items)),
+                    "split": split,
+                },
+            )
 
-        recs: List[RecommendItem] = []
-        for r in items:
-            # tolerate dicts with extra keys
-            recs.append(RecommendItem(**r))
+        # Build minimal stable payload
+        payload: Dict[str, Any] = {
+            "user_idx": user_idx,
+            "k": k,
+            "split": split,
+            "recommendations": items,
+        }
 
-        dbg_obj = None
         if debug:
-            dbg = out.get("debug", {}) or {}
-            if isinstance(dbg, dict):
-                dbg_obj = RecommendDebug(
-                    split=split,
-                    project_root=dbg.get("project_root"),
-                    candidates_path=dbg.get("candidates_path"),
-                    session_features_path=dbg.get("session_features_path"),
-                    ranker_path=dbg.get("ranker_path"),
-                    ranker_meta_path=dbg.get("ranker_meta_path"),
-                    model_auc=dbg.get("model_auc"),
-                    feature_order=dbg.get("feature_order"),
-                    candidate_count=dbg.get("candidate_count"),
-                    extra={k: v for k, v in dbg.items() if k not in {
-                        "project_root",
-                        "candidates_path",
-                        "session_features_path",
-                        "ranker_path",
-                        "ranker_meta_path",
-                        "model_auc",
-                        "feature_order",
-                        "candidate_count",
-                    }},
-                )
+            payload["debug"] = out.get("debug", {})
+        else:
+            payload["debug"] = None
 
-        return RecommendResponse(
-            user_idx=user_idx,
-            k=k,
-            split=split,
-            recommendations=recs,
-            debug=dbg_obj,
-        )
+        return JSONResponse(status_code=200, content=payload)
 
-    except HTTPException:
-        raise
     except FileNotFoundError as e:
-        # Missing model/features/candidates
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        # Critical: convert to HTTPException
-        # so connection doesn't hard-drop.
-        raise HTTPException(
+        return JSONResponse(
             status_code=500,
-            detail=f"/recommend failed: {type(e).__name__}: {e}",
+            content={
+                "error": "FileNotFoundError",
+                "detail": str(e),
+                "split": split,
+            },
+        )
+    except Exception as e:
+        # Critical: never raise here; always respond
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": type(e).__name__,
+                "detail": str(e),
+                "split": split,
+                "hint": "Check reco_service_v4.recommend output shape and poster/session paths.",
+            },
         )
 
 
-@app.post("/feedback", response_model=FeedbackResponse)
-def feedback(evt: FeedbackEvent) -> FeedbackResponse:
+@app.post("/feedback")
+def feedback(evt: FeedbackEvent):
     """
-    Simple feedback endpoint.
-    The service should update in-memory/session store or write to a lightweight log.
-    If the service doesn't implement persistence yet, we still acknowledge safely.
+    Lightweight feedback endpoint.
+    If the service exposes record_feedback/feedback, invoke it.
+    Otherwise acknowledge OK to keep UI stable.
     """
     try:
-        # Default split handling:
-        # feedback is not split-specific in UX,
-        # but we keep parity with service constructor.
-        svc = get_service("val")
+        svc = _svc("val")
 
-        # If your service implements feedback(), call it.
         if hasattr(svc, "record_feedback"):
             svc.record_feedback(
                 user_idx=evt.user_idx,
@@ -221,14 +172,11 @@ def feedback(evt: FeedbackEvent) -> FeedbackResponse:
                 event=evt.event,
                 ts=evt.ts,
             )
-        # else: no-op, still OK
 
-        return FeedbackResponse()
+        return JSONResponse(status_code=200, content={"status": "ok", "version": "v4"})
 
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(
+        return JSONResponse(
             status_code=500,
-            detail=f"/feedback failed: {type(e).__name__}: {e}",
+            content={"error": type(e).__name__, "detail": str(e)},
         )
