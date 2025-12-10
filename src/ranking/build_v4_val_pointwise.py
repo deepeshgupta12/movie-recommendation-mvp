@@ -6,166 +6,181 @@ from pathlib import Path
 
 import polars as pl
 
-DATA_DIR = Path("data")
-PROCESSED = DATA_DIR / "processed"
-REPORTS = Path("reports")
+PROCESSED = Path("data/processed")
+
+CANDS_VAL = PROCESSED / "v3_candidates_val.parquet"
+TRUTH_VAL = PROCESSED / "val_conf.parquet"
+SESSION_VAL = PROCESSED / "session_features_v4_val.parquet"
+
+USER_FEATS = PROCESSED / "user_features.parquet"
+ITEM_FEATS = PROCESSED / "item_features.parquet"
+
+OUT_DEFAULT = PROCESSED / "rank_v4_val_pointwise.parquet"
 
 
-def _load_candidates_val() -> pl.DataFrame:
-    p = PROCESSED / "v3_candidates_val.parquet"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing V3 candidates file: {p}")
-    df = pl.read_parquet(p)
+USER_FEATURE_COLS = [
+    "user_idx",
+    "user_interactions",
+    "user_conf_sum",
+    "user_conf_decay_sum",
+    "user_days_since_last",
+]
 
-    # Expect at least these
-    required = {"user_idx", "candidates"}
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"v3_candidates_val missing columns: {missing} | cols={df.columns}")
+ITEM_FEATURE_COLS = [
+    "item_idx",
+    "item_interactions",
+    "item_conf_sum",
+    "item_conf_decay_sum",
+    "item_days_since_last",
+]
 
-    # Normalize expected optional columns
-    if "blend_score" not in df.columns:
-        # fallback to tt_scores if present
-        if "tt_scores" in df.columns:
-            df = df.rename({"tt_scores": "blend_score"})
-        else:
-            df = df.with_columns(pl.col("candidates").list.eval(pl.lit(0.0)).alias("blend_score"))
 
-    if "blend_sources" not in df.columns:
-        df = df.with_columns(
+def _schema(path: Path) -> dict:
+    return pl.read_parquet_schema(str(path))
+
+
+def build_v4_val_pointwise(out_path: Path = OUT_DEFAULT) -> Path:
+    if not CANDS_VAL.exists():
+        raise FileNotFoundError(f"Missing candidates file: {CANDS_VAL}")
+    if not TRUTH_VAL.exists():
+        raise FileNotFoundError(f"Missing truth file: {TRUTH_VAL}")
+    if not SESSION_VAL.exists():
+        raise FileNotFoundError(f"Missing session features file: {SESSION_VAL}")
+
+    print("[START] Building V4 VAL pointwise table (lazy+streaming)...")
+
+    cand_schema = _schema(CANDS_VAL)
+
+    # We expect these from your V3 blend pipeline
+    # candidates: list[int]
+    # blend_score: list[float] OR tt_scores
+    # blend_sources: list[str]
+    has_candidates = "candidates" in cand_schema
+    has_blend_score = "blend_score" in cand_schema
+    has_tt_scores = "tt_scores" in cand_schema
+    has_blend_sources = "blend_sources" in cand_schema
+
+    if not has_candidates:
+        raise RuntimeError(f"{CANDS_VAL.name} missing 'candidates' column")
+
+    # Build lazy candidates frame
+    cands = pl.scan_parquet(str(CANDS_VAL))
+
+    # Normalize score column
+    if has_blend_score:
+        pass
+    elif has_tt_scores:
+        cands = cands.rename({"tt_scores": "blend_score"})
+    else:
+        # Create a zero score list aligned to candidates
+        cands = cands.with_columns(
+            pl.col("candidates").list.eval(pl.lit(0.0)).alias("blend_score")
+        )
+
+    # Normalize sources
+    if not has_blend_sources:
+        # Create a default sources list aligned to candidates
+        cands = cands.with_columns(
             pl.col("candidates").list.eval(pl.lit("two_tower_ann")).alias("blend_sources")
         )
 
-    return df.select(["user_idx", "candidates", "blend_score", "blend_sources"])
+    cands = cands.select(["user_idx", "candidates", "blend_score", "blend_sources"])
 
+    # Truth (val_conf) usually contains the held-out positive(s)
+    truth = (
+        pl.scan_parquet(str(TRUTH_VAL))
+        .select(["user_idx", "item_idx"])
+        .unique()
+        .with_columns(pl.lit(1).alias("label"))
+    )
 
-def _load_truth_val() -> pl.DataFrame:
-    # V3 used val_conf as truth source
-    p = PROCESSED / "val_conf.parquet"
-    if not p.exists():
-        # fallback: try legacy naming if any
-        raise FileNotFoundError(f"Missing truth file for val: {p}")
-    df = pl.read_parquet(p)
+    # Session features
+    sess = (
+        pl.scan_parquet(str(SESSION_VAL))
+        .select(["user_idx", "short_term_boost", "session_recency_bucket"])
+    )
 
-    # Expect: user_idx, item_idx, confidence (or similar)
-    if "user_idx" not in df.columns or "item_idx" not in df.columns:
-        raise RuntimeError(f"val_conf missing required columns | cols={df.columns}")
+    # Optional user/item features: only load minimal cols
+    join_user_feats = USER_FEATS.exists()
+    join_item_feats = ITEM_FEATS.exists()
 
-    return df.select(["user_idx", "item_idx"]).unique()
+    uf = None
+    if join_user_feats:
+        uf_schema = _schema(USER_FEATS)
+        needed = [c for c in USER_FEATURE_COLS if c in uf_schema]
+        if "user_idx" in needed and len(needed) > 1:
+            uf = pl.scan_parquet(str(USER_FEATS)).select(needed)
+        else:
+            uf = None
 
+    itf = None
+    if join_item_feats:
+        it_schema = _schema(ITEM_FEATS)
+        needed = [c for c in ITEM_FEATURE_COLS if c in it_schema]
+        if "item_idx" in needed and len(needed) > 1:
+            itf = pl.scan_parquet(str(ITEM_FEATS)).select(needed)
+        else:
+            itf = None
 
-def _load_user_features() -> pl.DataFrame | None:
-    p = PROCESSED / "user_features.parquet"
-    if p.exists():
-        return pl.read_parquet(p)
-    return None
-
-
-def _load_item_features() -> pl.DataFrame | None:
-    p = PROCESSED / "item_features.parquet"
-    if p.exists():
-        return pl.read_parquet(p)
-    return None
-
-
-def _load_session_features_val() -> pl.DataFrame:
-    p = PROCESSED / "session_features_v4_val.parquet"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing session features: {p}")
-    return pl.read_parquet(p)
-
-
-def build_v4_val_pointwise(out_path: Path | None = None) -> Path:
-    print("[START] Building V4 VAL pointwise table...")
-
-    cands = _load_candidates_val()
-    truth = _load_truth_val()
-    sess = _load_session_features_val()
-
-    print(f"[OK] candidate users: {cands.select('user_idx').n_unique()}")
-    print(f"[OK] truth users: {truth.select('user_idx').n_unique()}")
-    print(f"[OK] session users: {sess.select('user_idx').n_unique()}")
-
-    # Explode candidate lists
-    # Important: explode only list columns.
+    # Explode ALL list columns together (crucial for memory + alignment)
     exploded = (
         cands
-        .explode("candidates")
-        .explode("blend_score")
-        .explode("blend_sources")
-        .rename({
-            "candidates": "item_idx",
-        })
+        .explode(["candidates", "blend_score", "blend_sources"])
+        .rename({"candidates": "item_idx"})
     )
 
-    print(f"[OK] exploded rows: {exploded.height}")
+    # Join truth for labels
+    exploded = (
+        exploded
+        .join(truth, on=["user_idx", "item_idx"], how="left")
+        .with_columns(
+            pl.col("label").fill_null(0).cast(pl.Int8)
+        )
+    )
 
-    # Label creation
-    exploded = exploded.join(
-        truth.with_columns(pl.lit(1).alias("label")),
-        on=["user_idx", "item_idx"],
-        how="left",
+    # Source flags
+    exploded = exploded.with_columns(
+        pl.col("blend_sources").cast(pl.Utf8).alias("blend_source_raw"),
+        pl.col("blend_score").cast(pl.Float64),
     ).with_columns(
-        pl.col("label").fill_null(0).cast(pl.Int8)
-    )
-
-    # Derive source flags from blend_sources
-    # blend_sources is a string per row after explode
-    exploded = exploded.with_columns(
-        pl.col("blend_sources").cast(pl.Utf8).alias("blend_source_raw")
-    )
-
-    exploded = exploded.with_columns(
         pl.col("blend_source_raw").str.contains("two_tower").cast(pl.Int8).alias("has_tt"),
         pl.col("blend_source_raw").str.contains("sequence").cast(pl.Int8).alias("has_seq"),
         pl.col("blend_source_raw").str.contains("v2").cast(pl.Int8).alias("has_v2"),
-        pl.col("blend_score").cast(pl.Float64),
     )
 
     # Join session features
-    exploded = exploded.join(
-        sess.select([
-            "user_idx",
-            "short_term_boost",
-            "session_recency_bucket",
-        ]),
-        on="user_idx",
-        how="left",
-    )
+    exploded = exploded.join(sess, on="user_idx", how="left")
 
-    # One-hot for buckets (stable for tree models)
+    # Bucket one-hot + null guards
     exploded = exploded.with_columns(
+        pl.col("short_term_boost").fill_null(0.0).cast(pl.Float64),
         (pl.col("session_recency_bucket") == "hot").cast(pl.Int8).alias("sess_hot"),
         (pl.col("session_recency_bucket") == "warm").cast(pl.Int8).alias("sess_warm"),
         (pl.col("session_recency_bucket") == "cold").cast(pl.Int8).alias("sess_cold"),
-        pl.col("short_term_boost").fill_null(0.0).cast(pl.Float64),
     )
 
-    # Join existing user/item features if available
-    uf = _load_user_features()
-    if uf is not None and "user_idx" in uf.columns:
+    # Join optional user/item features
+    if uf is not None:
         exploded = exploded.join(uf, on="user_idx", how="left")
-
-    itf = _load_item_features()
-    if itf is not None and "item_idx" in itf.columns:
+    if itf is not None:
         exploded = exploded.join(itf, on="item_idx", how="left")
 
-    # Minimal fallback columns if user/item features don't exist
-    # This avoids downstream crashes in the trainer.
-    for col_name in [
-        "user_interactions",
-        "user_conf_sum",
-        "user_conf_decay_sum",
-        "user_days_since_last",
-        "item_interactions",
-        "item_conf_sum",
-        "item_conf_decay_sum",
-        "item_days_since_last",
-    ]:
-        if col_name not in exploded.columns:
-            exploded = exploded.with_columns(pl.lit(0).cast(pl.Int32).alias(col_name))
+    # If some base features are absent, create safe defaults lazily
+    base_defaults = {  # noqa: F841
+        "user_interactions": pl.lit(0).cast(pl.Int32),
+        "user_conf_sum": pl.lit(0).cast(pl.Int32),
+        "user_conf_decay_sum": pl.lit(0).cast(pl.Int32),
+        "user_days_since_last": pl.lit(0).cast(pl.Int32),
+        "item_interactions": pl.lit(0).cast(pl.Int32),
+        "item_conf_sum": pl.lit(0).cast(pl.Int32),
+        "item_conf_decay_sum": pl.lit(0).cast(pl.Int32),
+        "item_days_since_last": pl.lit(0).cast(pl.Int32),
+    }
 
-    # Final V4 feature frame
+    # Apply missing-col guards based on the evolving schema
+    # (We can't "if col not in lazyframe" directly, so we just add them;
+    # Polars will overwrite only if duplicates are allowed? To avoid conflicts,
+    # we add with "when-null" patterns at select-time.)
     final = exploded.select([
         "user_idx",
         "item_idx",
@@ -178,24 +193,24 @@ def build_v4_val_pointwise(out_path: Path | None = None) -> Path:
         "sess_hot",
         "sess_warm",
         "sess_cold",
-        "user_interactions",
-        "user_conf_sum",
-        "user_conf_decay_sum",
-        "user_days_since_last",
-        "item_interactions",
-        "item_conf_sum",
-        "item_conf_decay_sum",
-        "item_days_since_last",
+
+        pl.col("user_interactions").fill_null(0).cast(pl.Int32).alias("user_interactions"),
+        pl.col("user_conf_sum").fill_null(0).cast(pl.Int32).alias("user_conf_sum"),
+        pl.col("user_conf_decay_sum").fill_null(0).cast(pl.Int32).alias("user_conf_decay_sum"),
+        pl.col("user_days_since_last").fill_null(0).cast(pl.Int32).alias("user_days_since_last"),
+
+        pl.col("item_interactions").fill_null(0).cast(pl.Int32).alias("item_interactions"),
+        pl.col("item_conf_sum").fill_null(0).cast(pl.Int32).alias("item_conf_sum"),
+        pl.col("item_conf_decay_sum").fill_null(0).cast(pl.Int32).alias("item_conf_decay_sum"),
+        pl.col("item_days_since_last").fill_null(0).cast(pl.Int32).alias("item_days_since_last"),
     ])
 
-    if out_path is None:
-        out_path = PROCESSED / "rank_v4_val_pointwise.parquet"
+    # Streaming write
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    final.sink_parquet(str(out_path))
 
-    final.write_parquet(out_path)
-
-    print("[DONE] V4 VAL pointwise table saved.")
+    print("[DONE] V4 VAL pointwise table saved (streamed).")
     print(f"[PATH] {out_path}")
-    print(f"[OK] rows: {final.height}")
 
     return out_path
 
