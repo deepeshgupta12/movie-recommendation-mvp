@@ -1,551 +1,199 @@
-"""
-Unified Streamlit UI for Movie Recommendation MVP (V3 + V4)
-
-Fixes included:
-1) Restores Netflix-like feedback controls:
-   - Start, Watched, Like, Watch Later
-   - Sends POST /feedback to the selected API.
-2) Buckets rows using flags (has_seq/has_tt/has_v2).
-3) Continue Watching row is driven by Streamlit session_state.
-4) Robust poster resolution:
-   - API poster_url
-   - auto-scan data/processed for any *poster*.parquet
-   - supports flexible column names for item + poster URL.
-5) Correct path usage for app inside /ui.
-"""
-
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple  # noqa: UP035
+import json
+from typing import Dict, List, Optional  # noqa: UP035
 
-import polars as pl
 import requests
 import streamlit as st
 
-# -----------------------------
-# Project root resolution
-# -----------------------------
-
-APP_FILE = Path(__file__).resolve()
-PROJECT_ROOT = APP_FILE.parents[1]  # repo root assuming ui/streamlit_app.py
-DATA_DIR = PROJECT_ROOT / "data" / "processed"
-
-
-# -----------------------------
-# Streamlit config
-# -----------------------------
-
+# ---------- Config ----------
 st.set_page_config(
     page_title="Movie Recommendation MVP",
     layout="wide",
 )
 
-
-# -----------------------------
-# Poster map loader (robust)
-# -----------------------------
-
-ITEM_COL_CANDIDATES = ["item_idx", "item_id", "itemIndex", "item"]
-POSTER_COL_CANDIDATES = ["poster_url", "poster", "posterUrl", "image_url", "img_url"]
+DEFAULT_API_V4 = "http://127.0.0.1:8004"
+DEFAULT_API_V3 = "http://127.0.0.1:8003"
 
 
-def _extract_poster_map(df: pl.DataFrame) -> Dict[int, str]:
-    cols = set(df.columns)
-
-    item_col = next((c for c in ITEM_COL_CANDIDATES if c in cols), None)
-    poster_col = next((c for c in POSTER_COL_CANDIDATES if c in cols), None)
-
-    if not item_col or not poster_col:
-        return {}
-
-    out: Dict[int, str] = {}
-    for idx, url in zip(df[item_col].to_list(), df[poster_col].to_list()):
-        if idx is None or url is None:
-            continue
-        try:
-            out[int(idx)] = str(url)
-        except Exception:
-            continue
-    return out
-
-
-@st.cache_data(show_spinner=False)
-def load_local_poster_map() -> Dict[int, str]:
-    """
-    Attempts to load poster mapping from multiple likely sources.
-
-    Strategy:
-    1) Check commonly named files.
-    2) Scan data/processed for any parquet with 'poster' in filename.
-    """
-    common_files = [
-        DATA_DIR / "item_metadata.parquet",
-        DATA_DIR / "item_posters.parquet",
-        DATA_DIR / "posters.parquet",
-        DATA_DIR / "items.parquet",
-        DATA_DIR / "item_features.parquet",
-    ]
-
-    # 1) Priority files first
-    for p in common_files:
-        if p.exists():
-            try:
-                df = pl.read_parquet(p)
-                m = _extract_poster_map(df)
-                if m:
-                    return m
-            except Exception:
-                pass
-
-    # 2) Scan any *poster*.parquet
-    if DATA_DIR.exists():
-        for p in sorted(DATA_DIR.glob("*poster*.parquet")):
-            try:
-                df = pl.read_parquet(p)
-                m = _extract_poster_map(df)
-                if m:
-                    return m
-            except Exception:
-                continue
-
-    return {}
-
-
-def poster_for_item(item: Dict[str, Any], poster_map: Dict[int, str]) -> Optional[str]:
-    """
-    Priority:
-    1) API-provided poster_url
-    2) Local poster map lookup
-    """
-    p = item.get("poster_url")
-    if p:
-        return p
-
-    idx = item.get("item_idx")
-    if idx is not None:
-        return poster_map.get(int(idx))
-
-    return None
-
-
-# -----------------------------
-# API helpers
-# -----------------------------
-
-def api_get(base: str, path: str, params: Optional[dict] = None) -> dict:
-    url = f"{base.rstrip('/')}{path}"
-    r = requests.get(url, params=params, timeout=60)
+# ---------- Helpers ----------
+def _api_get(url: str, params: dict):
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-def api_post(base: str, path: str, payload: dict) -> dict:
-    url = f"{base.rstrip('/')}{path}"
-    r = requests.post(url, json=payload, timeout=60)
+def _api_post(url: str, payload: dict):
+    r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-def fetch_recommendations(
-    base: str,
-    user_idx: int,
-    k: int,
-    include_titles: bool,
-    debug: bool,
-    split: str,
-) -> List[Dict[str, Any]]:
-    payload = api_get(
-        base,
-        "/recommend",
-        params={
-            "user_idx": user_idx,
-            "k": k,
-            "include_titles": include_titles,
-            "debug": debug,
-            "split": split,
-        },
-    )
+def _render_card(item: dict, api_base: str, split: str):
+    title = item.get("title") or f"item_idx:{item.get('item_idx')}"
+    poster_url = item.get("poster_url")
 
-    recs = payload.get("recommendations")
-    if recs is None:
-        recs = payload.get("items", [])
+    with st.container(border=True):
+        if poster_url:
+            st.image(poster_url, use_container_width=True)
+        else:
+            # Light placeholder block
+            st.markdown(
+                "<div style='height:240px; background:#111827; border-radius:8px; "
+                "display:flex; align-items:center; justify-content:center; color:#9CA3AF;'>"
+                "Poster unavailable"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
-    if not isinstance(recs, list):
-        return []
+        st.markdown(f"**{title}**")
+        st.caption(f"item_idx: {item.get('item_idx')} | movieId: {item.get('movieId')}")
+        st.write(item.get("reason", ""))
+        st.caption(f"score: {round(float(item.get('score', 0.0)), 4)}")
 
-    return recs
+        cols = st.columns(4)
+        user_idx = st.session_state.get("user_idx")
 
-
-def send_feedback(
-    base: str,
-    user_idx: int,
-    item_idx: int,
-    event: str,
-    split: str,
-) -> Tuple[bool, str]:
-    """
-    Sends feedback to POST /feedback.
-    Returns (ok, message).
-    """
-    try:
-        out = api_post(
-            base,
-            "/feedback",
-            {
-                "user_idx": user_idx,
-                "item_idx": item_idx,
+        def send(event: str):
+            if user_idx is None:
+                return
+            payload = {
+                "user_idx": int(user_idx),
+                "item_idx": int(item["item_idx"]),
                 "event": event,
                 "split": split,
-            },
-        )
-        return True, str(out)
-    except requests.HTTPError as e:
-        # Most common: 404 if endpoint not yet added in v4 API
-        try:
-            return False, e.response.text
-        except Exception:
-            return False, str(e)
-    except Exception as e:
-        return False, str(e)
+            }
+            _api_post(f"{api_base}/feedback", payload)
+
+        if cols[0].button("Start", key=f"start_{split}_{item['item_idx']}"):
+            send("start")
+            st.session_state["refresh"] = True
+
+        if cols[1].button("Watched", key=f"watched_{split}_{item['item_idx']}"):
+            send("watched")
+            st.session_state["refresh"] = True
+
+        if cols[2].button("Like", key=f"like_{split}_{item['item_idx']}"):
+            send("like")
+            st.session_state["refresh"] = True
+
+        if cols[3].button("Watch Later", key=f"wl_{split}_{item['item_idx']}"):
+            send("watch_later")
+            st.session_state["refresh"] = True
 
 
-# -----------------------------
-# Category logic (flag-first)
-# -----------------------------
-
-def bucket_items(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    buckets = {
-        "Because you watched recently": [],
-        "Similar to your taste": [],
-        "Popular among similar users": [],
-        "More picks for you": [],
-    }
-
-    for it in items:
-        has_seq = int(it.get("has_seq", 0) or 0)
-        has_tt = int(it.get("has_tt", 0) or 0)
-        has_v2 = int(it.get("has_v2", 0) or 0)
-
-        if has_seq == 1:
-            buckets["Because you watched recently"].append(it)
-        elif has_tt == 1:
-            buckets["Similar to your taste"].append(it)
-        elif has_v2 == 1:
-            buckets["Popular among similar users"].append(it)
-        else:
-            buckets["More picks for you"].append(it)
-
-    return {k: v for k, v in buckets.items() if v}
-
-
-# -----------------------------
-# Session-state helpers
-# -----------------------------
-
-def ensure_state():
-    st.session_state.setdefault("continue_watching", [])  # list of item dicts
-    st.session_state.setdefault("liked_items", set())
-    st.session_state.setdefault("watched_items", set())
-    st.session_state.setdefault("watch_later_items", set())
-    st.session_state.setdefault("last_items", [])  # last fetched list
-
-
-def add_continue_item(item: Dict[str, Any]):
-    """
-    Add/move item to Continue Watching row.
-    Dedup by item_idx.
-    """
-    cw = st.session_state["continue_watching"]
-    idx = item.get("item_idx")
-    if idx is None:
+def _render_section(title: str, items: List[dict], api_base: str, split: str):
+    if not items:
         return
-
-    cw = [x for x in cw if x.get("item_idx") != idx]
-    cw.insert(0, item)
-    st.session_state["continue_watching"] = cw[:20]
-
-
-# -----------------------------
-# Render helpers
-# -----------------------------
-
-def render_continue_watching(poster_map: Dict[int, str]):
-    st.subheader("Continue Watching")
-
-    cw = st.session_state.get("continue_watching", [])
-    if not cw:
-        st.info("No items available for this row yet.")
-        return
-
+    st.subheader(title)
+    # 5-column grid
     cols = st.columns(5)
-    for i, it in enumerate(cw[:10]):
+    for i, item in enumerate(items):
         with cols[i % 5]:
-            title = it.get("title") or f"Item {it.get('item_idx')}"
-            poster = poster_for_item(it, poster_map)
-
-            if poster:
-                st.image(poster, use_container_width=True)
-            else:
-                st.markdown(
-                    f"""
-                    <div style="
-                        height:200px;
-                        border:1px solid #2a2a2a;
-                        border-radius:10px;
-                        padding:10px;
-                        background:#0f0f0f;
-                        display:flex;
-                        align-items:center;
-                        justify-content:center;
-                        text-align:center;">
-                        <div style="font-size:12px; line-height:1.3;">
-                            {title}
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            st.caption(title)
+            _render_card(item, api_base=api_base, split=split)
 
 
-def render_card(
-    it: Dict[str, Any],
-    poster_map: Dict[int, str],
-    base_url: str,
-    user_idx: int,
-    split: str,
-    mode: str,
-):
-    title = it.get("title") or f"Item {it.get('item_idx')}"
-    score = it.get("score")
-    idx = it.get("item_idx")
+# ---------- Sidebar ----------
+st.sidebar.title("Mode")
 
-    poster = poster_for_item(it, poster_map)
+version = st.sidebar.radio(
+    "Select version",
+    ["V4 (Session-aware + Online Feedback Overlay)", "V3 (Feedback-loop)"],
+    index=0,
+)
 
-    if poster:
-        st.image(poster, use_container_width=True)
-    else:
-        st.markdown(
-            f"""
-            <div style="
-                height:240px;
-                border:1px solid #2a2a2a;
-                border-radius:10px;
-                padding:12px;
-                background:#0f0f0f;
-                display:flex;
-                align-items:center;
-                justify-content:center;
-                text-align:center;">
-                <div style="font-size:13px; line-height:1.3;">
-                    {title}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+st.sidebar.divider()
 
-    st.caption(title)
-    if idx is not None:
-        st.caption(f"item_idx: {idx}")
+st.sidebar.title("API")
+api_base = st.sidebar.text_input(
+    "Base URL",
+    value=DEFAULT_API_V4 if version.startswith("V4") else DEFAULT_API_V3,
+)
 
-    if score is not None:
-        try:
-            st.caption(f"score: {float(score):.4f}")
-        except Exception:
-            st.caption(f"score: {score}")
+split = st.sidebar.selectbox("Split", ["val", "test"], index=0)
 
-    # reason line
-    reason = it.get("reason")
-    if reason:
-        st.caption(reason)
+st.sidebar.divider()
 
-    # Feedback controls
-    if idx is not None:
-        c1, c2, c3, c4 = st.columns(4)
+st.sidebar.title("Request")
+user_idx = st.sidebar.number_input("user_idx", min_value=0, value=9764, step=1)
+k = st.sidebar.slider("k", min_value=5, max_value=50, value=20, step=1)
+include_titles = st.sidebar.checkbox("include_titles", value=True)
+debug = st.sidebar.checkbox("debug", value=False)
+apply_feedback = st.sidebar.checkbox("apply_feedback_overlay (V4)", value=True)
 
-        # Unique keys include mode so V3/V4 toggles don't collide
-        key_base = f"{mode}_{user_idx}_{idx}_{split}"
-
-        with c1:
-            if st.button("Start", key=f"start_{key_base}", use_container_width=True):
-                ok, msg = send_feedback(base_url, user_idx, int(idx), "start", split)
-                add_continue_item(it)
-                if ok:
-                    st.toast("Start recorded")
-                else:
-                    st.error(f"/feedback failed: {msg}")
-
-                st.rerun()
-
-        with c2:
-            if st.button("Watched", key=f"watched_{key_base}", use_container_width=True):
-                ok, msg = send_feedback(base_url, user_idx, int(idx), "watched", split)
-                st.session_state["watched_items"].add(int(idx))
-                if ok:
-                    st.toast("Watched recorded")
-                else:
-                    st.error(f"/feedback failed: {msg}")
-
-                st.rerun()
-
-        with c3:
-            if st.button("Like", key=f"like_{key_base}", use_container_width=True):
-                ok, msg = send_feedback(base_url, user_idx, int(idx), "like", split)
-                st.session_state["liked_items"].add(int(idx))
-                if ok:
-                    st.toast("Like recorded")
-                else:
-                    st.error(f"/feedback failed: {msg}")
-
-                st.rerun()
-
-        with c4:
-            if st.button("Watch later", key=f"wl_{key_base}", use_container_width=True):
-                ok, msg = send_feedback(base_url, user_idx, int(idx), "watch_later", split)
-                st.session_state["watch_later_items"].add(int(idx))
-                if ok:
-                    st.toast("Watch Later recorded")
-                else:
-                    st.error(f"/feedback failed: {msg}")
-
-                st.rerun()
+if st.sidebar.button("Reset My Feedback"):
+    try:
+        _api_post(f"{api_base}/feedback", {"user_idx": int(user_idx), "item_idx": -1, "event": "reset", "split": split})
+        st.sidebar.success("Feedback reset.")
+    except Exception as e:
+        st.sidebar.error(str(e))
 
 
-def render_card_grid(
-    items: List[Dict[str, Any]],
-    poster_map: Dict[int, str],
-    base_url: str,
-    user_idx: int,
-    split: str,
-    mode: str,
-    cols_per_row: int = 5,
-):
-    cols = st.columns(cols_per_row)
-
-    for i, it in enumerate(items):
-        with cols[i % cols_per_row]:
-            render_card(it, poster_map, base_url, user_idx, split, mode)
-
-
-def render_section(
-    heading: str,
-    items: List[Dict[str, Any]],
-    poster_map: Dict[int, str],
-    base_url: str,
-    user_idx: int,
-    split: str,
-    mode: str,
-):
-    st.subheader(heading)
-    render_card_grid(items, poster_map, base_url, user_idx, split, mode)
-    st.write("")
-
-
-# -----------------------------
-# UI
-# -----------------------------
-
-ensure_state()
-
+# ---------- Main ----------
 st.title("Movie Recommendation MVP")
 
-with st.sidebar:
-    st.header("Mode")
-    mode = st.radio(
-        "Select version",
-        ["V4 (Session-aware)", "V3 (Feedback-loop)"],
-        index=0,
-    )
+st.session_state["user_idx"] = int(user_idx)
+st.session_state.setdefault("refresh", False)
 
-    st.divider()
+# Health check
+try:
+    health = _api_get(f"{api_base}/health", {})
+    st.success(f"API ok: {health}")
+except Exception as e:
+    st.error(f"API not reachable: {e}")
 
-    st.header("API")
-    default_v4 = "http://127.0.0.1:8004"
-    default_v3 = "http://127.0.0.1:8003"
+get_btn = st.button("Get Recommendations")
 
-    base_url = st.text_input(
-        "Base URL",
-        value=default_v4 if mode.startswith("V4") else default_v3
-    )
+should_fetch = get_btn or st.session_state.get("refresh", False)
 
-    split = st.selectbox("Split", ["val", "test"], index=0)
+if should_fetch:
+    st.session_state["refresh"] = False
+    params = {
+        "user_idx": int(user_idx),
+        "k": int(k),
+        "include_titles": bool(include_titles),
+        "debug": bool(debug),
+        "split": split,
+    }
+    if version.startswith("V4"):
+        params["apply_feedback"] = bool(apply_feedback)
 
-    st.divider()
-
-    st.header("Request")
-    user_idx = st.number_input("user_idx", min_value=0, max_value=200000, value=9764, step=1)
-    k = st.slider("k", min_value=5, max_value=200, value=20, step=5)
-    include_titles = st.checkbox("include_titles", value=True)
-    debug = st.checkbox("debug", value=False)
-
-    fetch_btn = st.button("Get Recommendations", use_container_width=True)
-
-
-poster_map = load_local_poster_map()
-
-# Top row: Continue Watching
-render_continue_watching(poster_map)
-
-st.write("")
-
-if fetch_btn:
     try:
-        health = api_get(base_url, "/health")
-        st.success(f"API ok: {health}")
-
-        items = fetch_recommendations(
-            base=base_url,
-            user_idx=int(user_idx),
-            k=int(k),
-            include_titles=include_titles,
-            debug=debug,
-            split=split,
-        )
-
-        st.session_state["last_items"] = items
-
-        if not items:
-            st.warning("No recommendations returned.")
-        else:
-            buckets = bucket_items(items)
-
-            order = [
-                "Because you watched recently",
-                "Similar to your taste",
-                "Popular among similar users",
-                "More picks for you",
-            ]
-
-            for key in order:
-                if key in buckets:
-                    render_section(
-                        key,
-                        buckets[key],
-                        poster_map,
-                        base_url,
-                        int(user_idx),
-                        split,
-                        mode,
-                    )
-
-        if debug:
-            st.caption("Debug is enabled.")
-
-    except requests.HTTPError as e:
-        st.error(f"HTTP error: {e}")
-        try:
-            st.code(e.response.text)
-        except Exception:
-            pass
+        rec = _api_get(f"{api_base}/recommend", params)
+        st.session_state["last_rec"] = rec
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Recommend failed: {e}")
 
+rec = st.session_state.get("last_rec")
 
-st.divider()
-st.caption(
-    f"App file: {APP_FILE} | Project root: {PROJECT_ROOT}. "
-    "Posters render from API poster_url or any local *poster*.parquet under data/processed."
-)
+if rec:
+    sections = rec.get("sections") or {}
+    items = rec.get("items") or rec.get("recommendations") or []
+
+    # Continue Watching row first (Netflix feel)
+    _render_section("Continue Watching", sections.get("continue_watching", []), api_base, split)
+
+    # Session-aware row
+    _render_section("Because you watched", sections.get("because_you_watched", []), api_base, split)
+
+    # Taste row
+    _render_section("Similar to your taste", sections.get("similar_to_your_taste", []), api_base, split)
+
+    # Popular row
+    _render_section("Popular among similar users", sections.get("popular_among_similar_users", []), api_base, split)
+
+    # Fallback row
+    _render_section("More for you", sections.get("more_for_you", []), api_base, split)
+
+    # If API didn't provide sections, fallback to flat render
+    if not sections and items:
+        st.subheader("Top Picks For You")
+        cols = st.columns(5)
+        for i, item in enumerate(items):
+            with cols[i % 5]:
+                _render_card(item, api_base=api_base, split=split)
+
+    if debug and rec.get("debug"):
+        st.divider()
+        st.subheader("Debug")
+        st.code(json.dumps(rec["debug"], indent=2))

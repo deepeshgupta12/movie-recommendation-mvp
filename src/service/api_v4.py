@@ -1,179 +1,109 @@
-"""
-V4 API (Session-aware ranker)
-
-FastAPI layer for V4 recommendations.
-
-Guarantees:
-- Split-aware cached service instances.
-- API response contract is stable and ALWAYS returns:
-    {
-      user_idx,
-      split,
-      k,
-      recommendations: [...]
-      debug: {... optional ...}
-    }
-
-Compatibility:
-- If service returns "items", API maps it to "recommendations".
-- If service returns a list, wraps it into "recommendations".
-"""
-
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Any, Dict, List, Optional  # noqa: UP035
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 
-from src.service.reco_service_v4 import V4RecommenderService, V4ServiceConfig
+from src.service.reco_service_v4 import get_v4_service
 
-app = FastAPI(
-    title="Movie Recommendation API - V4",
-    version="4.0.2",
-    description="Session-aware hybrid recommender (ANN + GRU + V2 prior + Session features).",
-)
-
-_SERVICE_CACHE: Dict[str, V4RecommenderService] = {}
+app = FastAPI(title="Movie Recommendation MVP - V4", version="v4")
 
 
-def _get_service(split: str) -> V4RecommenderService:
-    split = (split or "val").strip().lower()
-    if split not in {"val", "test"}:
-        raise HTTPException(status_code=400, detail=f"Invalid split='{split}'. Use val|test.")
+class HealthResponse(BaseModel):
+    status: str = "ok"
+    version: str = "v4"
 
-    if split in _SERVICE_CACHE:
-        return _SERVICE_CACHE[split]
 
-    cfg = V4ServiceConfig(split=split)
-    svc = V4RecommenderService(cfg)
-    _SERVICE_CACHE[split] = svc
-    return svc
+class FeedbackRequest(BaseModel):
+    user_idx: int = Field(..., ge=0)
+    item_idx: int = Field(..., ge=-1)
+    event: str = Field(..., description="like, unlike, watched, watch_later, remove_watch_later, start, remove_start, reset")
+    split: str = Field("val")
+
+
+class FeedbackResponse(BaseModel):
+    status: str = "ok"
+    user_idx: int
+    state: Dict[str, List[int]]
+
+
+class RecItem(BaseModel):
+    item_idx: int
+    movieId: Optional[int] = None
+    title: Optional[str] = None
+    poster_url: Optional[str] = None
+    score: float
+    reason: str
+    has_tt: int = 0
+    has_seq: int = 0
+    has_v2: int = 0
+    short_term_boost: float = 0.0
+    sess_hot: int = 0
+    sess_warm: int = 0
+    sess_cold: int = 0
 
 
 class RecommendResponse(BaseModel):
-    user_idx: int = Field(..., ge=0)
+    user_idx: int
+    k: int
     split: str
-    k: int = Field(..., ge=1, le=200)
-
-    # We intentionally DO NOT use alias here.
-    # Normalization happens in code, so the response model is strict & stable.
-    recommendations: List[Any] = Field(default_factory=list)
-
-    debug: Optional[dict] = None
-
-    model_config = {"extra": "allow"}
+    items: List[RecItem]
+    # Backward compatibility for older UI hooks:
+    recommendations: List[RecItem]
+    # New: sectioned UI rows
+    sections: Dict[str, List[RecItem]] = Field(default_factory=dict)
+    debug: Optional[Dict[str, Any]] = None
 
 
-def _normalize_out(
-    *,
-    raw: Any,
-    user_idx: int,
-    split: str,
-    k: int,
-) -> dict:
-    """
-    Normalize service output into the API contract.
-
-    Supported shapes:
-    1) dict with "recommendations"
-    2) dict with "items"
-    3) list of items
-    """
-    if isinstance(raw, list):
-        return {
-            "user_idx": user_idx,
-            "split": split,
-            "k": k,
-            "recommendations": raw,
-            "debug": None,
-        }
-
-    if not isinstance(raw, dict):
-        return {
-            "user_idx": user_idx,
-            "split": split,
-            "k": k,
-            "recommendations": [],
-            "debug": {"warning": f"Unexpected service output type: {type(raw)}"},
-        }
-
-    # Determine recommendations payload
-    if isinstance(raw.get("recommendations"), list):
-        recs = raw["recommendations"]
-    elif isinstance(raw.get("items"), list):
-        recs = raw["items"]
-    else:
-        recs = []
-
-    out = {
-        "user_idx": raw.get("user_idx", user_idx),
-        "split": raw.get("split", split),
-        "k": raw.get("k", k),
-        "recommendations": recs,
-        "debug": raw.get("debug"),
-    }
-
-    # Preserve extra keys if any (non-breaking)
-    for key, val in raw.items():
-        if key not in out and key != "items":
-            out[key] = val
-
-    return out
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "version": "v4"}
-
-
-@app.get("/config")
-def config(split: str = Query("val")):
-    try:
-        svc = _get_service(split)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    cfg = getattr(svc, "cfg", None)
-    if cfg is None:
-        return {"split": split, "note": "service config not exposed"}
-
-    try:
-        return asdict(cfg)
-    except Exception:
-        # dataclass might not be used; safe fallback
-        return {"split": getattr(cfg, "split", split)}
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse()
 
 
 @app.get("/recommend", response_model=RecommendResponse)
 def recommend(
     user_idx: int = Query(..., ge=0),
     k: int = Query(20, ge=1, le=200),
-    include_titles: bool = Query(True),
-    debug: bool = Query(False),
+    include_titles: bool = True,
+    debug: bool = False,
     split: str = Query("val"),
-):
-    """
-    Recommend top-k items for a given user_idx using V4 session-aware ranker.
-    """
-    try:
-        svc = _get_service(split)
-        raw = svc.recommend(
-            user_idx=user_idx,
-            k=k,
-            include_titles=include_titles,
-            debug=debug,
-        )
+    apply_feedback: bool = Query(True),
+) -> RecommendResponse:
+    svc = get_v4_service(split=split)
+    out = svc.recommend(
+        user_idx=user_idx,
+        k=k,
+        include_titles=include_titles,
+        debug=debug,
+        apply_feedback=apply_feedback,
+    )
+    # Ensure both keys exist for response validation
+    if "recommendations" not in out:
+        out["recommendations"] = out.get("items", [])
+    if "items" not in out:
+        out["items"] = out.get("recommendations", [])
+    if "sections" not in out:
+        out["sections"] = {}
+    return RecommendResponse(**out)
 
-        out = _normalize_out(raw=raw, user_idx=user_idx, split=split, k=k)
-        return out
 
-    except HTTPException:
-        raise
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"V4 recommend failed: {e}")
+@app.post("/feedback", response_model=FeedbackResponse)
+def feedback(req: FeedbackRequest) -> FeedbackResponse:
+    svc = get_v4_service(split=req.split)
+    if req.event.lower().strip() == "reset":
+        svc.feedback.reset_user(req.user_idx)
+    else:
+        svc.record_feedback(req.user_idx, req.item_idx, req.event)
+
+    state = svc.get_user_state(req.user_idx)
+    return FeedbackResponse(user_idx=req.user_idx, state=state)
+
+
+@app.get("/user_state", response_model=Dict[str, List[int]])
+def user_state(
+    user_idx: int = Query(..., ge=0),
+    split: str = Query("val"),
+) -> Dict[str, List[int]]:
+    svc = get_v4_service(split=split)
+    return svc.get_user_state(user_idx)
