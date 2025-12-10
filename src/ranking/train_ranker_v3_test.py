@@ -3,43 +3,47 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple  # noqa: UP035
+from typing import List, Tuple  # noqa: UP035
 
 import numpy as np
 import polars as pl
+from joblib import dump
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
 
-# -------------------------
-# Config / Paths
-# -------------------------
+from src.config.settings import settings
 
-@dataclass
-class RankerV3TestConfig:
-    # Inputs
-    candidates_path: str = "data/processed/v3_candidates_test.parquet"
-    test_conf_path: str = "data/processed/test_conf.parquet"
-    user_features_path: str = "data/processed/user_features.parquet"
-    item_features_path: str = "data/processed/item_features.parquet"
+# -----------------------------
+# Robust path resolution
+# -----------------------------
+# File is: <repo>/src/ranking/train_ranker_v3_test.py
+# parents[0]=ranking, [1]=src, [2]=repo root
+BASE_DIR = Path(__file__).resolve().parents[2]
 
-    # Outputs
-    out_pointwise_path: str = "data/processed/rank_v3_test_pointwise.parquet"
-    model_path: str = "reports/models/ranker_hgb_v3_test.pkl"
-    meta_path: str = "reports/models/ranker_hgb_v3_test.meta.json"
+DATA_DIR = Path(getattr(settings, "DATA_DIR", BASE_DIR / "data"))
+PROCESSED_DIR = DATA_DIR / "processed"
 
-    # Training limits
-    max_users: int = 50000
-    max_candidates_per_user: int = 200
-
-    # Train/val split
-    val_frac: float = 0.2
-    seed: int = 42
+REPORTS_DIR = Path(getattr(settings, "REPORTS_DIR", BASE_DIR / "reports"))
+MODELS_DIR = REPORTS_DIR / "models"
 
 
-# Locked feature order for V3 ranker
-FEATURE_ORDER_V3: List[str] = [
+# -----------------------------
+# Paths
+# -----------------------------
+POINTWISE_PATH = PROCESSED_DIR / "rank_v3_test_pointwise.parquet"
+CANDIDATES_PATH = PROCESSED_DIR / "v3_candidates_test.parquet"
+TEST_CONF_PATH = PROCESSED_DIR / "test_conf.parquet"
+
+MODEL_PATH = MODELS_DIR / "ranker_hgb_v3_test.pkl"
+META_PATH = MODELS_DIR / "ranker_hgb_v3_test.meta.json"
+
+
+# -----------------------------
+# Locked feature order
+# -----------------------------
+FEATURES_LOCKED: List[str] = [
     "blend_score",
     "has_tt",
     "has_seq",
@@ -55,245 +59,119 @@ FEATURE_ORDER_V3: List[str] = [
 ]
 
 
-# -------------------------
-# Helpers
-# -------------------------
-
-def _ensure_parents(path_str: str) -> None:
-    p = Path(path_str)
-    p.parent.mkdir(parents=True, exist_ok=True)
+def _ensure_dirs() -> None:
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _parse_source_flags(src_list: Optional[List[str]]) -> Tuple[int, int, int]:
-    """
-    blend_sources is a list[str] aligned to candidates.
-    Each entry may contain comma-separated sources like:
-      "two_tower_ann,sequence_gru,v2_prior"
-    Return flags (has_tt, has_seq, has_v2) for a single candidate row.
-    """
-    if not src_list:
-        return 0, 0, 0
+def _build_pointwise_if_missing() -> None:
+    if POINTWISE_PATH.exists():
+        print(f"[SKIP] Pointwise table already exists:\n  [PATH] {POINTWISE_PATH}")
+        return
 
-    # We'll accept either a single string or a list of strings.
-    # In exploded context we'll pass a single raw string token.
-    s = ",".join(src_list) if isinstance(src_list, list) else str(src_list)
-    s_low = s.lower()
+    print("[INFO] Pointwise table missing. Building via src.ranking.build_v3_test_pointwise...")
+    from src.ranking.build_v3_test_pointwise import build_v3_test_pointwise
 
-    has_tt = 1 if ("two_tower" in s_low or "tt" in s_low or "ann" in s_low) else 0
-    has_seq = 1 if ("sequence" in s_low or "gru" in s_low or "seq" in s_low) else 0
-    has_v2 = 1 if ("v2" in s_low or "prior" in s_low or "pop" in s_low or "genre" in s_low) else 0
-
-    return has_tt, has_seq, has_v2
+    build_v3_test_pointwise(
+        candidates_path=str(CANDIDATES_PATH),
+        truth_path=str(TEST_CONF_PATH),
+        out_path=str(POINTWISE_PATH),
+    )
 
 
-def _explode_candidates(df: pl.DataFrame, max_k: int) -> pl.DataFrame:
-    """
-    Input format expected:
-      user_idx
-      candidates: list[int]
-      blend_scores: list[float] (optional)
-      blend_sources: list[str] (optional)
-    """
-    cols = df.columns
+def _load_pointwise() -> pl.DataFrame:
+    if not POINTWISE_PATH.exists():
+        raise FileNotFoundError(f"Pointwise file not found: {POINTWISE_PATH}")
 
-    if "candidates" not in cols:
-        raise ValueError("v3_candidates_test.parquet must contain 'candidates' list column.")
+    df = pl.read_parquet(str(POINTWISE_PATH))
 
-    # Normalize optional cols
-    if "blend_scores" not in cols:
-        # create dummy scores aligned to candidates
-        df = df.with_columns(
-            pl.col("candidates").list.len().alias("_cand_len")
-        ).with_columns(
-            pl.arange(0, pl.col("_cand_len")).cast(pl.Float64).alias("_tmp_idx")
+    missing = [c for c in FEATURES_LOCKED + ["label"] if c not in df.columns]
+    if missing:
+        raise RuntimeError(
+            "Pointwise table missing required columns: "
+            + ", ".join(missing)
+            + "\nRebuild the pointwise file."
         )
-        # We can't easily build list of zeros per row without udf; simplest:
-        # just set a scalar 0.0 then expand after explode.
-        df = df.drop(["_cand_len", "_tmp_idx"])
-        df = df.with_columns(pl.lit(None).alias("blend_scores"))
-
-    if "blend_sources" not in cols:
-        df = df.with_columns(pl.lit(None).alias("blend_sources"))
-
-    # Truncate per-user to max_k before explode if possible
-    df = df.with_columns(
-        pl.col("candidates").list.head(max_k).alias("candidates"),
-        pl.col("blend_scores").list.head(max_k).alias("blend_scores"),
-        pl.col("blend_sources").list.head(max_k).alias("blend_sources"),
-    )
-
-    exploded = df.explode(["candidates", "blend_scores", "blend_sources"]).rename(
-        {
-            "candidates": "item_idx",
-            "blend_scores": "blend_score",
-            "blend_sources": "blend_source_raw",
-        }
-    )
-
-    # If blend_score is null (because missing earlier), set 0
-    exploded = exploded.with_columns(
-        pl.col("blend_score").fill_null(0.0).cast(pl.Float64)
-    )
-
-    return exploded
-
-
-def _build_pointwise_table(cfg: RankerV3TestConfig) -> pl.DataFrame:
-    print("\n[START] Building V3 TEST training table...")
-
-    cand = pl.read_parquet(cfg.candidates_path)
-    test_conf = pl.read_parquet(cfg.test_conf_path)
-
-    print(f"[OK] v3 candidate users (raw): {cand.select('user_idx').n_unique()}")
-    print(f"[OK] test_conf rows: {test_conf.height}")
-
-    # Cap users for local
-    cand = cand.sort("user_idx").head(cfg.max_users)
-
-    # Build truth per user for labeling
-    # We'll only label items that appear in test_conf
-    # Join on user_idx, item_idx later.
-    truth = test_conf.select(["user_idx", "item_idx"]).unique()
-
-    print(f"[OK] truth users: {truth.select('user_idx').n_unique()}")
-
-    print("[START] Exploding candidate lists...")
-    exploded = _explode_candidates(cand, max_k=cfg.max_candidates_per_user)
-
-    print(f"[OK] exploded rows: {exploded.height}")
-
-    print("[START] Creating labels...")
-    exploded = exploded.join(
-        truth.with_columns(pl.lit(1).alias("label")),
-        on=["user_idx", "item_idx"],
-        how="left",
-    ).with_columns(
-        pl.col("label").fill_null(0).cast(pl.Int8)
-    )
-
-    print("[START] Deriving source flags...")
-    # Use a Python-side map for robustness across Polars versions
-    # We collect blend_source_raw as a python list of strings
-    src_py = exploded.select("blend_source_raw").to_series().to_list()
-    flags = [_parse_source_flags([s] if s is not None else None) for s in src_py]
-    has_tt = [f[0] for f in flags]
-    has_seq = [f[1] for f in flags]
-    has_v2 = [f[2] for f in flags]
-
-    exploded = exploded.with_columns(
-        pl.Series("has_tt", has_tt).cast(pl.Int8),
-        pl.Series("has_seq", has_seq).cast(pl.Int8),
-        pl.Series("has_v2", has_v2).cast(pl.Int8),
-    )
-
-    print("[START] Joining user/item features...")
-    user_feat = pl.read_parquet(cfg.user_features_path)
-    item_feat = pl.read_parquet(cfg.item_features_path)
-
-    df = (
-        exploded
-        .join(user_feat, on="user_idx", how="left")
-        .join(item_feat, on="item_idx", how="left")
-    )
-
-    # Fill null numeric
-    for c in df.columns:
-        if c in ("user_idx", "item_idx", "blend_source_raw"):
-            continue
-        if df[c].dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64, pl.Float32, pl.Float64):
-            df = df.with_columns(pl.col(c).fill_null(0))
-
-    print(f"[OK] final training rows: {df.height}")
-
-    _ensure_parents(cfg.out_pointwise_path)
-    df.write_parquet(cfg.out_pointwise_path)
-
-    print("[DONE] V3 TEST training table saved.")
-    print(f"[PATH] {Path(cfg.out_pointwise_path).resolve()}")
 
     return df
 
 
-def _train_hgb(cfg: RankerV3TestConfig, df: pl.DataFrame) -> None:
-    print("\n[START] Training V3 TEST ranker...")
+def _prepare_xy(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    X = df.select(FEATURES_LOCKED).to_numpy()
+    y = df.select("label").to_numpy().reshape(-1)
+    return X, y
 
-    # Shuffle and split
-    rng = np.random.default_rng(cfg.seed)
-    idx = np.arange(df.height)
-    rng.shuffle(idx)
 
-    n_val = int(df.height * cfg.val_frac)
-    val_idx = idx[:n_val]
-    train_idx = idx[n_val:]
+def _train_model(X: np.ndarray, y: np.ndarray) -> Tuple[HistGradientBoostingClassifier, float]:
+    X_train, X_val, y_train, y_val = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y if len(np.unique(y)) > 1 else None,
+    )
 
-    # Build numpy arrays with locked feature order
-    # Ensure missing columns get filled with 0
-    for col in FEATURE_ORDER_V3 + ["label"]:
-        if col not in df.columns:
-            df = df.with_columns(pl.lit(0).alias(col))
-
-    train_df = df[train_idx]
-    val_df = df[val_idx]
-
-    X_train = train_df.select(FEATURE_ORDER_V3).to_numpy()
-    y_train = train_df.select("label").to_numpy().ravel()
-
-    X_val = val_df.select(FEATURE_ORDER_V3).to_numpy()
-    y_val = val_df.select("label").to_numpy().ravel()
-
-    pos_rate = float(y_train.mean()) if len(y_train) else 0.0
-
-    print(f"[OK] Train rows: {len(train_idx)} | Val rows: {len(val_idx)}")
+    pos_rate = float(np.mean(y_train)) if len(y_train) else 0.0
+    print(f"[OK] Train rows: {X_train.shape[0]} | Val rows: {X_val.shape[0]}")
     print(f"[OK] Train positive rate: {pos_rate:.4f}")
 
     model = HistGradientBoostingClassifier(
         max_depth=6,
         learning_rate=0.08,
-        max_iter=250,
-        random_state=cfg.seed,
+        max_iter=200,
+        random_state=42,
+        verbose=0,
     )
 
     model.fit(X_train, y_train)
 
-    # AUC
-    try:
-        p_val = model.predict_proba(X_val)[:, 1]
-        auc = float(roc_auc_score(y_val, p_val))
-    except Exception:
-        auc = float("nan")
+    if len(np.unique(y_val)) > 1:
+        y_pred = model.predict_proba(X_val)[:, 1]
+        auc = float(roc_auc_score(y_val, y_pred))
+    else:
+        auc = 0.0
 
-    _ensure_parents(cfg.model_path)
-    _ensure_parents(cfg.meta_path)
+    return model, auc
 
-    # Persist model
-    import joblib
-    joblib.dump(model, cfg.model_path)
+
+def main() -> None:
+    _ensure_dirs()
+
+    print("\n[START] Building V3 TEST training table...")
+    _build_pointwise_if_missing()
+
+    df = _load_pointwise()
+
+    print(f"[OK] final training rows: {df.height}")
+    print("[DONE] V3 TEST training table ready.")
+    print(f"[PATH] {POINTWISE_PATH}")
+
+    print("\n[START] Training V3 TEST ranker...")
+
+    X, y = _prepare_xy(df)
+    model, auc = _train_model(X, y)
+
+    dump(model, str(MODEL_PATH))
 
     meta = {
-        "split": "test",
-        "features": FEATURE_ORDER_V3,
+        "model": "HistGradientBoostingClassifier",
         "auc": auc,
-        "train_rows": int(len(train_idx)),
-        "val_rows": int(len(val_idx)),
-        "train_pos_rate": pos_rate,
-        "config": asdict(cfg),
-        "model_type": "HistGradientBoostingClassifier",
+        "features_locked": FEATURES_LOCKED,
+        "pointwise_path": str(POINTWISE_PATH),
+        "candidates_path": str(CANDIDATES_PATH),
+        "truth_path": str(TEST_CONF_PATH),
+        "rows": int(df.height),
+        "positive_rate": float(np.mean(y)) if len(y) else 0.0,
+        "random_state": 42,
     }
 
-    Path(cfg.meta_path).write_text(json.dumps(meta, indent=2))
+    META_PATH.write_text(json.dumps(meta, indent=2))
 
     print("[DONE] V3 TEST ranker trained.")
     print(f"[OK] AUC={auc:.4f}")
-    print(f"[PATH] {Path(cfg.model_path).resolve()}")
-    print(f"[PATH] {Path(cfg.meta_path).resolve()}")
-    print(f"[OK] Features used (locked order): {FEATURE_ORDER_V3}")
-
-
-def main():
-    cfg = RankerV3TestConfig()
-
-    df = _build_pointwise_table(cfg)
-    _train_hgb(cfg, df)
+    print(f"[PATH] {MODEL_PATH}")
+    print(f"[PATH] {META_PATH}")
+    print(f"[OK] Features used (locked order): {FEATURES_LOCKED}")
 
 
 if __name__ == "__main__":

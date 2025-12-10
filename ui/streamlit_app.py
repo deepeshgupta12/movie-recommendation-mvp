@@ -1,491 +1,387 @@
+# ui/streamlit_app.py
 from __future__ import annotations
 
-import time
+import os
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional  # noqa: UP035
 
 import requests
 import streamlit as st
 
-from ui.diversity_rerank import apply_diversity_pipeline
-from ui.feedback_store import log_feedback
-from ui.home_rows import (
-    filter_recs_by_genres,
-    get_title_genres,
-    get_trending_items,
-)
-from ui.poster_renderer import render_poster_or_placeholder
-from ui.realtime_rerank import apply_feedback_rerank, get_user_liked_genres
-from ui.session_store import (
-    get_continue_watching_items,
-    get_last_watched_item,
-    log_watch_event,
-)
+# ------------------------------
+# Config
+# ------------------------------
 
-DEFAULT_API = "http://127.0.0.1:8000"
-POSTER_CACHE_PATH = "data/processed/item_posters.json"
-FEEDBACK_PATH = "data/processed/ui_feedback.jsonl"
+DEFAULT_API_BASE = os.getenv("V3_API_BASE", "http://127.0.0.1:8003")
+
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+OMDB_API_KEY = os.getenv("OMDB_API_KEY", "").strip()
+
+POSTER_PLACEHOLDER = "https://via.placeholder.com/342x513.png?text=Poster+Unavailable"
+
+CARDS_PER_ROW = 5
+DEFAULT_USER_IDX = 9764
+DEFAULT_K = 20
 
 
-def _api_get(path: str, base_url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30):
-    url = f"{base_url.rstrip('/')}{path}"
-    return requests.get(url, params=params or {}, timeout=timeout)
+# ------------------------------
+# Data model
+# ------------------------------
+
+@dataclass
+class RecoItem:
+    item_idx: int
+    title: str
+    score: float
+    reason: Optional[str] = None
+    has_tt: int = 0
+    has_seq: int = 0
+    has_v2: int = 0
+    poster_url: Optional[str] = None
 
 
-def fetch_health(base_url: str) -> bool:
-    try:
-        r = _api_get("/health", base_url, timeout=5)
-        return r.status_code == 200
-    except Exception:
-        return False
-
+# ------------------------------
+# API helpers
+# ------------------------------
 
 @st.cache_data(show_spinner=False, ttl=60)
-def fetch_recommendations_cached(
-    base_url: str,
+def _api_get_recommendations(
+    api_base: str,
     user_idx: int,
     k: int,
-    refresh_token: int,
-) -> List[Dict[str, Any]]:
-    """
-    refresh_token is intentionally part of the cache key
-    to allow controlled cache busting from the UI.
-    """
-    _ = refresh_token  # used only to vary cache key
-    r = _api_get(f"/recommend/user/{user_idx}", base_url, params={"k": k})
+    include_titles: bool,
+    debug: bool,
+    split: str,
+) -> Dict[str, Any]:
+    url = f"{api_base}/recommend"
+    params = {
+        "user_idx": int(user_idx),
+        "k": int(k),
+        "include_titles": bool(include_titles),
+        "debug": bool(debug),
+        "split": split,
+    }
+    r = requests.get(url, params=params, timeout=60)
     if r.status_code != 200:
-        raise RuntimeError(f"API error ({r.status_code}): {r.text}")
+        raise RuntimeError(f"API error {r.status_code}: {r.text}")
     return r.json()
 
 
-@st.cache_data(show_spinner=False)
-def load_poster_cache() -> Dict[int, str]:
-    import json
-    from pathlib import Path
+def _api_post_feedback(api_base: str, user_idx: int, item_idx: int, action: str) -> Dict[str, Any]:
+    url = f"{api_base}/feedback"
+    payload = {"user_idx": int(user_idx), "item_idx": int(item_idx), "action": action}
+    r = requests.post(url, json=payload, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"API error {r.status_code}: {r.text}")
+    return r.json()
 
-    p = Path(POSTER_CACHE_PATH)
-    if not p.exists():
-        return {}
+
+@st.cache_data(show_spinner=False, ttl=10)
+def _api_get_user_state(api_base: str, user_idx: int) -> Dict[str, Any]:
+    url = f"{api_base}/user_state"
+    params = {"user_idx": int(user_idx)}
+    r = requests.get(url, params=params, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"API error {r.status_code}: {r.text}")
+    return r.json()
+
+
+# ------------------------------
+# Poster resolvers
+# ------------------------------
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _tmdb_search_poster(title: str) -> Optional[str]:
+    if not TMDB_API_KEY:
+        return None
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-        out = {}
-        for k, v in raw.items():
-            try:
-                out[int(k)] = str(v)
-            except Exception:
-                continue
-        return out
+        url = "https://api.themoviedb.org/3/search/movie"
+        params = {"api_key": TMDB_API_KEY, "query": title}
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        results = data.get("results") or []
+        if not results:
+            return None
+        poster_path = results[0].get("poster_path")
+        if not poster_path:
+            return None
+        return f"https://image.tmdb.org/t/p/w342{poster_path}"
     except Exception:
-        return {}
+        return None
 
 
-def style():
-    st.set_page_config(
-        page_title="Movie Recommendation MVP",
-        page_icon="🎬",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _omdb_search_poster(title: str) -> Optional[str]:
+    if not OMDB_API_KEY:
+        return None
+    try:
+        url = "https://www.omdbapi.com/"
+        params = {"apikey": OMDB_API_KEY, "t": title}
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        poster = data.get("Poster")
+        if poster and poster != "N/A":
+            return poster
+        return None
+    except Exception:
+        return None
 
+
+def _resolve_poster(item: RecoItem) -> str:
+    if item.poster_url:
+        return item.poster_url
+    p = _tmdb_search_poster(item.title)
+    if p:
+        return p
+    p = _omdb_search_poster(item.title)
+    if p:
+        return p
+    return POSTER_PLACEHOLDER
+
+
+# ------------------------------
+# Normalization & bucketing
+# ------------------------------
+
+def _normalize_items(payload: Dict[str, Any]) -> List[RecoItem]:
+    raw = payload.get("items") or payload.get("recommendations") or []
+    out: List[RecoItem] = []
+    for r in raw:
+        out.append(
+            RecoItem(
+                item_idx=int(r.get("item_idx")),
+                title=str(r.get("title") or "Unknown Title"),
+                score=float(r.get("score", 0.0)),
+                reason=r.get("reason"),
+                has_tt=int(r.get("has_tt", 0)),
+                has_seq=int(r.get("has_seq", 0)),
+                has_v2=int(r.get("has_v2", 0)),
+                poster_url=r.get("poster_url"),
+            )
+        )
+    return out
+
+
+def _bucket_label(item: RecoItem) -> str:
+    if item.has_seq:
+        return "Because you watched recently"
+    if item.has_tt:
+        return "Similar to your taste"
+    if item.has_v2:
+        return "Popular among similar users"
+    if item.reason:
+        if "Because you watched" in item.reason:
+            return "Because you watched recently"
+        if "Similar to your taste" in item.reason:
+            return "Similar to your taste"
+        if "Popular among similar users" in item.reason:
+            return "Popular among similar users"
+    return "More picks for you"
+
+
+def _group_by_bucket(items: List[RecoItem]) -> Dict[str, List[RecoItem]]:
+    buckets: Dict[str, List[RecoItem]] = {}
+    for it in items:
+        key = _bucket_label(it)
+        buckets.setdefault(key, []).append(it)
+    return buckets
+
+
+# ------------------------------
+# UI render
+# ------------------------------
+
+def _render_card(
+    api_base: str,
+    user_idx: int,
+    item: RecoItem,
+    state: Dict[str, List[int]],
+):
+    poster = _resolve_poster(item)
+    st.image(poster, use_container_width=True)
     st.markdown(
-        """
-        <style>
-        .block-container { padding-top: 1.0rem; padding-bottom: 2rem; }
-
-        .pill {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 999px;
-            margin-right: 6px;
-            margin-bottom: 6px;
-            background: rgba(255,255,255,0.07);
-            font-size: 0.78rem;
-        }
-
-        .score-box {
-            background: rgba(255,255,255,0.06);
-            padding: 6px 10px;
-            border-radius: 10px;
-            display: inline-block;
-            font-weight: 600;
-            font-size: 0.92rem;
-        }
-
-        /* Poster placeholder */
-        .ph-card {
-            border-radius: 14px;
-            padding: 14px;
-            background:
-                radial-gradient(1200px 500px at 20% 10%, rgba(255,255,255,0.08), transparent),
-                linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
-            border: 1px solid rgba(255,255,255,0.08);
-            display: flex;
-            flex-direction: column;
-            justify-content: flex-end;
-        }
-        .ph-badge {
-            font-size: 0.7rem;
-            opacity: 0.7;
-            margin-bottom: auto;
-        }
-        .ph-title {
-            font-weight: 700;
-            font-size: 1.0rem;
-            line-height: 1.2;
-            margin-top: 8px;
-        }
-        .ph-genres {
-            margin-top: 8px;
-        }
-        .ph-chip {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 999px;
-            background: rgba(255,255,255,0.08);
-            font-size: 0.72rem;
-            margin-right: 6px;
-        }
-        </style>
+        f"""
+        <div style="font-weight:600; font-size: 0.95rem; line-height:1.2;">
+            {item.title}
+        </div>
         """,
         unsafe_allow_html=True,
     )
+    if item.reason:
+        st.caption(item.reason)
 
+    st.caption(f"Score {item.score:.4f}")
 
-def render_row_title(title: str, subtitle: str = ""):
-    c1, c2 = st.columns([3, 2])
+    liked = set(state.get("liked", []))
+    watched = set(state.get("watched", []))
+    started = set(state.get("started", []))
+
+    c1, c2, c3 = st.columns(3)
+
     with c1:
-        st.markdown(f"## {title}")
-        if subtitle:
-            st.caption(subtitle)
+        if item.item_idx in started:
+            if st.button("Started", key=f"unstart_{item.item_idx}"):
+                _api_post_feedback(api_base, user_idx, item.item_idx, "unstart")
+                _api_get_user_state.clear()
+                _api_get_recommendations.clear()
+                st.rerun()
+        else:
+            if st.button("Start", key=f"start_{item.item_idx}"):
+                _api_post_feedback(api_base, user_idx, item.item_idx, "start")
+                _api_get_user_state.clear()
+                st.rerun()
+
     with c2:
-        st.write("")
+        if item.item_idx in watched:
+            if st.button("Watched ✓", key=f"unwatch_{item.item_idx}"):
+                _api_post_feedback(api_base, user_idx, item.item_idx, "unwatch")
+                _api_get_user_state.clear()
+                _api_get_recommendations.clear()
+                st.rerun()
+        else:
+            if st.button("Watched", key=f"watched_{item.item_idx}"):
+                _api_post_feedback(api_base, user_idx, item.item_idx, "watched")
+                _api_get_user_state.clear()
+                _api_get_recommendations.clear()
+                st.rerun()
+
+    with c3:
+        if item.item_idx in liked:
+            if st.button("Liked ✓", key=f"unlike_{item.item_idx}"):
+                _api_post_feedback(api_base, user_idx, item.item_idx, "unlike")
+                _api_get_user_state.clear()
+                _api_get_recommendations.clear()
+                st.rerun()
+        else:
+            if st.button("Like", key=f"like_{item.item_idx}"):
+                _api_post_feedback(api_base, user_idx, item.item_idx, "like")
+                _api_get_user_state.clear()
+                _api_get_recommendations.clear()
+                st.rerun()
 
 
-def _repair_and_filter_metadata(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Ensures UI never displays empty-title cards.
-    Tries to repair missing title/genres using local lookup.
-    Drops items that still don't have a title.
-    """
-    out: List[Dict[str, Any]] = []
-    for it in items:
-        new_it = dict(it)
-        item_idx = new_it.get("item_idx", None)
-
-        title = str(new_it.get("title", "") or "").strip()
-        genres = str(new_it.get("genres", "") or "").strip()
-
-        if (not title or not genres) and item_idx is not None:
-            try:
-                t, g = get_title_genres(int(item_idx))
-                if not title:
-                    title = str(t or "").strip()
-                if not genres:
-                    genres = str(g or "").strip()
-            except Exception:
-                pass
-
-        if not title:
-            continue
-
-        new_it["title"] = title
-        new_it["genres"] = genres
-        out.append(new_it)
-
-    return out
-
-
-def render_horizontal_cards(
-    items: List[Dict[str, Any]],
+def _render_row(
+    api_base: str,
     user_idx: int,
-    poster_map: Dict[int, str],
-    row_key: str,
+    items: List[RecoItem],
+    state: Dict[str, List[int]],
 ):
-    items = _repair_and_filter_metadata(items)
-
-    if not items:
-        st.info("No items available for this row yet.")
-        return
-
-    cols = st.columns(min(len(items), 6))
-    for i, item in enumerate(items[:6]):
-        item_idx = int(item.get("item_idx", -1))
-        title = item.get("title", "")
-        genres = item.get("genres", "")
-        reasons = item.get("reasons", []) or []
-        score = float(item.get("score", 0.0))
-
-        with cols[i]:
-            poster = poster_map.get(item_idx)
-
-            render_poster_or_placeholder(
-                poster_url=poster,
-                title=title,
-                genres=genres,
-                height=220,
-            )
-
-            st.markdown(f"**{title}**")
-            st.caption(genres)
-
-            if reasons:
-                st.markdown(
-                    " ".join([f"<span class='pill'>{r}</span>" for r in reasons[:2]]),
-                    unsafe_allow_html=True,
-                )
-
-            st.markdown(f"<span class='score-box'>Score {score:.3f}</span>", unsafe_allow_html=True)
-
-            context = {"row": row_key, "title": title, "genres": genres}
-
-            if st.button("Start", key=f"{row_key}_start_{user_idx}_{item_idx}_{i}"):
-                log_watch_event(user_idx, item_idx, "watch_start", context=context)
-                st.toast("Added to Continue Watching")
-
-            if st.button("Watched", key=f"{row_key}_done_{user_idx}_{item_idx}_{i}"):
-                log_watch_event(user_idx, item_idx, "watch_complete", context=context)
-                st.toast("Marked as watched")
-
-            if st.button("Like", key=f"{row_key}_like_{user_idx}_{item_idx}_{i}"):
-                log_feedback(user_idx, item_idx, "like", context={"title": title, "genres": genres})
-                st.toast("Liked")
+    cols = st.columns(CARDS_PER_ROW)
+    for i, it in enumerate(items):
+        with cols[i % CARDS_PER_ROW]:
+            _render_card(api_base, user_idx, it, state)
 
 
-def render_taste_panel(user_idx: int):
-    st.subheader("Your recent taste (from likes)")
-    liked = get_user_liked_genres(user_idx, top_n=5)
-
-    if not liked:
-        st.caption("No liked-genre signals yet.")
-        return
-
-    cols = st.columns(len(liked))
-    for i, (g, c) in enumerate(liked):
-        with cols[i]:
-            st.metric(g, c)
-
-
-def build_continue_watching_row(user_idx: int) -> List[Dict[str, Any]]:
-    ids = get_continue_watching_items(user_idx)
-    out = []
-    for item_idx in ids[:20]:
-        title, genres = get_title_genres(item_idx)
-        out.append(
-            {
-                "item_idx": int(item_idx),
-                "title": title,
-                "genres": genres,
-                "score": 1.0,
-                "reasons": ["Continue watching"],
-            }
-        )
-    return out
-
-
-def build_because_you_watched_row(
+def _render_bucket(
+    api_base: str,
     user_idx: int,
-    recs: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    last = get_last_watched_item(user_idx)
-    if last is None or last < 0:
-        return []
+    title: str,
+    items: List[RecoItem],
+    state: Dict[str, List[int]],
+):
+    if not items:
+        return
+    st.subheader(title)
+    for i in range(0, len(items), CARDS_PER_ROW):
+        _render_row(api_base, user_idx, items[i:i + CARDS_PER_ROW], state)
 
-    title, genres = get_title_genres(last)
-    filtered = filter_recs_by_genres(recs, genres, limit=12)
 
-    out = []
-    for it in filtered:
-        new_it = dict(it)
-        rs = list(new_it.get("reasons", []) or [])
-        label = f"Because you watched {title}" if title else "Because you watched recently"
-        if label not in rs:
-            rs = [label] + rs
-        new_it["reasons"] = rs[:3]
-        out.append(new_it)
-
-    return out
-
+# ------------------------------
+# Page
+# ------------------------------
 
 def main():
-    style()
-    st.title("Movie Recommendation MVP — Home")
-
-    if "refresh_token" not in st.session_state:
-        st.session_state["refresh_token"] = 0
-
-    poster_map = load_poster_cache()
+    st.set_page_config(page_title="Movie Recommendation MVP V3", layout="wide")
+    st.title("Movie Recommendation MVP — V3")
 
     with st.sidebar:
-        st.header("Configuration")
-        base_url = st.text_input("API base URL", value=DEFAULT_API)
-        user_idx = st.number_input("user_idx", min_value=0, value=9764, step=1)
-        k = st.slider("Top-K (Top Picks)", min_value=5, max_value=50, value=10, step=5)
+        st.markdown("### V3 Controls")
+        api_base = st.text_input("API Base", value=DEFAULT_API_BASE)
+        split = st.selectbox("Split", options=["test", "val"], index=0)
+        user_idx = st.number_input("user_idx", min_value=0, value=DEFAULT_USER_IDX, step=1)
+        k = st.slider("Top-K", min_value=5, max_value=200, value=DEFAULT_K)
+        include_titles = st.checkbox("Include titles", value=True)
+        debug = st.checkbox("Debug payload", value=False)
 
-        auto_health = st.checkbox("Check API health", value=True)
-
-        st.divider()
-        st.header("Real-time personalization")
-        apply_live_boost = st.checkbox("Apply feedback boost", value=True)
-        boost_value = st.slider("Boost strength", 0.02, 0.15, 0.08, 0.01)
-
-        st.divider()
-        st.header("Slate diversity controls")
-        enable_diversity = st.checkbox("Enable diversity re-rank", value=True)
-        enable_genre_cap = st.checkbox("Genre cap", value=True)
-        max_per_genre = st.slider("Max items per primary genre", 1, 5, 3, 1)
-
-        enable_mmr = st.checkbox("MMR soft diversification", value=True)
-        lambda_relevance = st.slider(
-            "Relevance vs diversity (higher = more relevance)",
-            0.50, 0.95, 0.75, 0.05
+        st.markdown("---")
+        st.markdown("### Poster Providers (optional)")
+        st.code(
+            "export TMDB_API_KEY='...'\nexport OMDB_API_KEY='...'\nexport V3_API_BASE='http://127.0.0.1:8003'",
+            language="bash",
         )
 
-        st.divider()
-        st.caption("Feedback path")
-        st.code(FEEDBACK_PATH)
+        if st.button("Clear UI caches"):
+            _api_get_user_state.clear()
+            _api_get_recommendations.clear()
+            _tmdb_search_poster.clear()
+            _omdb_search_poster.clear()
+            st.success("Cleared caches.")
 
-        st.caption("Run API")
-        st.code("uvicorn app.main:app --reload")
+    # Server state
+    try:
+        state = _api_get_user_state(api_base, int(user_idx))
+    except Exception:
+        state = {"liked": [], "watched": [], "started": []}
 
-    if auto_health:
-        api_ok = fetch_health(base_url)
-        if api_ok:
-            st.success("API is reachable.")
-        else:
-            st.warning("API not reachable. Start FastAPI.")
+    # Continue Watching
+    st.subheader("Continue Watching")
+    started_ids = state.get("started", [])
+    if not started_ids:
+        st.info("No items here yet. Click Start on a movie to build your row.")
+    else:
+        # Build placeholder items for display; titles will render if later enriched by service
+        cw_items = [RecoItem(item_idx=i, title="(from activity)", score=0.0) for i in started_ids[:CARDS_PER_ROW]]
+        _render_row(api_base, int(user_idx), cw_items, state)
 
-    c1, c2, c3, _ = st.columns([1, 1, 1, 2])
-    with c1:
-        go = st.button("Load Home", type="primary", use_container_width=True)
-    with c2:
-        refresh = st.button("Refresh Home", use_container_width=True)
-    with c3:
-        clear = st.button("Clear", use_container_width=True)
+    # Activity sidebar on main page
+    with st.expander("My Activity", expanded=False):
+        st.write("Liked:", state.get("liked", []))
+        st.write("Watched:", state.get("watched", []))
+        st.write("Started:", state.get("started", []))
 
-    if refresh:
-        st.session_state["refresh_token"] += 1
-        st.session_state.pop("recs", None)
-        st.session_state.pop("lat_ms", None)
-        st.rerun()
-
-    if clear:
-        st.session_state.pop("recs", None)
-        st.session_state.pop("lat_ms", None)
-        st.rerun()
-
-    if go:
-        # API enforces k <= 50.
-        fetch_k = min(50, max(int(k), 30))
-        token = int(st.session_state["refresh_token"])
-
-        with st.spinner("Building Home rows..."):
-            t0 = time.perf_counter()
-            recs = fetch_recommendations_cached(base_url, int(user_idx), fetch_k, token)
-            t1 = time.perf_counter()
-
-        if apply_live_boost:
-            recs = apply_feedback_rerank(
-                recs=recs,
+    # Fetch recos
+    if st.button("Get Recommendations"):
+        try:
+            payload = _api_get_recommendations(
+                api_base=api_base,
                 user_idx=int(user_idx),
-                boost=float(boost_value),
+                k=int(k),
+                include_titles=include_titles,
+                debug=debug,
+                split=split,
             )
+            items = _normalize_items(payload)
+            st.session_state["last_payload"] = payload
+            st.session_state["last_items"] = items
+        except Exception as e:
+            st.error(str(e))
+            st.session_state["last_payload"] = None
+            st.session_state["last_items"] = []
 
-        st.session_state["recs"] = recs
-        st.session_state["lat_ms"] = (t1 - t0) * 1000.0
+    items: List[RecoItem] = st.session_state.get("last_items", [])
 
-    recs = st.session_state.get("recs", [])
+    if items:
+        buckets = _group_by_bucket(items)
+        ordered = [
+            "Because you watched recently",
+            "Similar to your taste",
+            "Popular among similar users",
+            "More picks for you",
+        ]
 
-    if not recs:
-        st.info("Click 'Load Home' to render rows.")
-        return
+        for key in ordered:
+            if key in buckets:
+                _render_bucket(api_base, int(user_idx), key, buckets[key], state)
 
-    lat_ms = st.session_state.get("lat_ms", None)
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("User", str(int(user_idx)))
-    with m2:
-        st.metric("Top Picks K", str(int(k)))
-    with m3:
-        st.metric("API latency (ms)", f"{lat_ms:.2f}" if lat_ms is not None else "—")
-
-    render_taste_panel(int(user_idx))
-    st.divider()
-
-    # Row 1: Continue Watching
-    continue_row = build_continue_watching_row(int(user_idx))
-    render_row_title("Continue Watching", "Local watch-state simulation")
-    render_horizontal_cards(continue_row, int(user_idx), poster_map, row_key="continue")
-
-    st.divider()
-
-    # Row 2: Top Picks For You
-    top_pool = recs[: max(int(k) * 3, 30)]
-    top_pool = _repair_and_filter_metadata(top_pool)
-
-    if enable_diversity:
-        top_picks = apply_diversity_pipeline(
-            items=top_pool,
-            k=int(k),
-            enable_genre_cap=enable_genre_cap,
-            max_per_genre=int(max_per_genre),
-            enable_mmr=enable_mmr,
-            lambda_relevance=float(lambda_relevance),
-        )
+        if debug and st.session_state.get("last_payload"):
+            st.markdown("### Debug payload")
+            st.json(st.session_state["last_payload"])
     else:
-        top_picks = top_pool[: int(k)]
-
-    # Repair again post-diversity (safe guard)
-    top_picks = _repair_and_filter_metadata(top_picks)
-
-    render_row_title("Top Picks For You", "V2 ranked hybrid output plus optional diversity re-rank")
-    render_horizontal_cards(top_picks, int(user_idx), poster_map, row_key="top_picks")
-
-    st.divider()
-
-    # Row 3: Because You Watched
-    because_pool = build_because_you_watched_row(int(user_idx), recs)
-    because_pool = _repair_and_filter_metadata(because_pool)
-
-    if enable_diversity and because_pool:
-        because_row = apply_diversity_pipeline(
-            items=because_pool,
-            k=min(10, len(because_pool)),
-            enable_genre_cap=enable_genre_cap,
-            max_per_genre=int(max_per_genre),
-            enable_mmr=enable_mmr,
-            lambda_relevance=float(lambda_relevance),
-        )
-    else:
-        because_row = because_pool[:10]
-
-    because_row = _repair_and_filter_metadata(because_row)
-
-    render_row_title("Because You Watched", "Derived from your last watch event")
-    render_horizontal_cards(because_row, int(user_idx), poster_map, row_key="because")
-
-    st.divider()
-
-    # Row 4: Trending Now
-    trending_pool = get_trending_items(limit=24)
-    trending_pool = _repair_and_filter_metadata(trending_pool)
-
-    if enable_diversity and trending_pool:
-        trending = apply_diversity_pipeline(
-            items=trending_pool,
-            k=10,
-            enable_genre_cap=enable_genre_cap,
-            max_per_genre=int(max_per_genre),
-            enable_mmr=enable_mmr,
-            lambda_relevance=float(lambda_relevance),
-        )
-    else:
-        trending = trending_pool[:10]
-
-    trending = _repair_and_filter_metadata(trending)
-
-    render_row_title("Trending Now", "Derived locally from item interaction features")
-    render_horizontal_cards(trending, int(user_idx), poster_map, row_key="trending")
-
-    st.caption("Step 7.5 closed: slate diversity, stable metadata, and controlled refresh.")
+        st.caption("Click 'Get Recommendations' to load V3 results.")
 
 
 if __name__ == "__main__":

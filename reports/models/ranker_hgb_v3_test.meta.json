@@ -1,6 +1,7 @@
 {
-  "split": "test",
-  "features": [
+  "model": "HistGradientBoostingClassifier",
+  "auc": 0.7566375855541347,
+  "features_locked": [
     "blend_score",
     "has_tt",
     "has_seq",
@@ -14,22 +15,10 @@
     "item_conf_decay_sum",
     "item_days_since_last"
   ],
-  "auc": 0.7647139016592411,
-  "train_rows": 8000000,
-  "val_rows": 2000000,
-  "train_pos_rate": 0.001313,
-  "config": {
-    "candidates_path": "data/processed/v3_candidates_test.parquet",
-    "test_conf_path": "data/processed/test_conf.parquet",
-    "user_features_path": "data/processed/user_features.parquet",
-    "item_features_path": "data/processed/item_features.parquet",
-    "out_pointwise_path": "data/processed/rank_v3_test_pointwise.parquet",
-    "model_path": "reports/models/ranker_hgb_v3_test.pkl",
-    "meta_path": "reports/models/ranker_hgb_v3_test.meta.json",
-    "max_users": 50000,
-    "max_candidates_per_user": 200,
-    "val_frac": 0.2,
-    "seed": 42
-  },
-  "model_type": "HistGradientBoostingClassifier"
+  "pointwise_path": "/Users/deepeshgupta/Projects/movie-recommendation-mvp/data/processed/rank_v3_test_pointwise.parquet",
+  "candidates_path": "/Users/deepeshgupta/Projects/movie-recommendation-mvp/data/processed/v3_candidates_test.parquet",
+  "truth_path": "/Users/deepeshgupta/Projects/movie-recommendation-mvp/data/processed/test_conf.parquet",
+  "rows": 10000000,
+  "positive_rate": 0.0013156,
+  "random_state": 42
 }
