@@ -26,24 +26,39 @@ __all__ = [
 
 
 # ---------------------------
-# Safe path helpers
+# Project root + safe dirs
 # ---------------------------
+# file: <root>/src/service/reco_service_v4.py
+# parents[0] = .../src/service
+# parents[1] = .../src
+# parents[2] = .../<root>
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _safe_reports_dir() -> Path:
+    """
+    Prefer settings.REPORTS_DIR if present.
+    Otherwise anchor to project root to avoid CWD issues.
+    """
     if settings is not None and hasattr(settings, "REPORTS_DIR"):
         try:
             return Path(getattr(settings, "REPORTS_DIR"))
         except Exception:
             pass
-    return Path("reports")
+    return PROJECT_ROOT / "reports"
 
 
 def _safe_data_dir() -> Path:
+    """
+    Prefer settings.DATA_DIR if present.
+    Otherwise anchor to project root to avoid CWD issues.
+    """
     if settings is not None and hasattr(settings, "DATA_DIR"):
         try:
             return Path(getattr(settings, "DATA_DIR"))
         except Exception:
             pass
-    return Path("data")
+    return PROJECT_ROOT / "data"
 
 
 def _first_existing(paths: List[Path]) -> Path:
@@ -60,7 +75,11 @@ def _first_existing(paths: List[Path]) -> Path:
 class V4ServiceConfig:
     """
     Online inference config for V4 session-aware ranker.
-    We keep candidate universe aligned to V3 blended candidates.
+    Candidate universe remains aligned to V3 blended candidates.
+
+    V4 ranker adds session features:
+    - short_term_boost
+    - sess_hot / sess_warm / sess_cold
     """
     split: str = "val"  # "val" or "test"
     cap_users: int = 50_000
@@ -87,15 +106,15 @@ class V4RecommenderService:
     """
     V4 session-aware online recommender.
 
-    Inputs used:
+    Inputs:
     - V3 blended candidates per user: v3_candidates_{split}.parquet
-    - V4 session features: session_features_v4_{split}.parquet
-    - Train confidence history for user/item aggregates
-    - V4 ranker (HGB)
-    - dim_items for titles/movieId
+    - V4 session features per user: session_features_v4_{split}.parquet
+    - Train history for user/item aggregates: train_conf.parquet
+    - V4 ranker: ranker_hgb_v4_{split}.pkl (+ meta)
+    - dim_items for titles/posters
 
     Output:
-    - Ranked items + reason + debug option
+    - Ranked items with reason + session debug scaffold.
     """
 
     def __init__(self, cfg: Optional[V4ServiceConfig] = None):
@@ -117,7 +136,7 @@ class V4RecommenderService:
     def _resolve_paths(self) -> None:
         split = self.cfg.split
 
-        # Candidates: V4 uses V3 blended candidates
+        # Candidates: V4 reuses V3 blended candidates
         default_candidates = self.data_dir / "processed" / f"v3_candidates_{split}.parquet"
         fallback_candidates = self.data_dir / "processed" / "v3_candidates_val.parquet"
 
@@ -143,7 +162,7 @@ class V4RecommenderService:
         default_train = self.data_dir / "processed" / "train_conf.parquet"
         self.train_conf_path = Path(self.cfg.train_conf_path or str(default_train))
 
-        # Ranker
+        # Ranker + meta
         default_ranker = self.reports_dir / "models" / f"ranker_hgb_v4_{split}.pkl"
         fallback_ranker = self.reports_dir / "models" / "ranker_hgb_v4_val.pkl"
 
@@ -166,17 +185,17 @@ class V4RecommenderService:
     def _load_dim_items(self) -> None:
         if not self.dim_items_path.exists():
             raise FileNotFoundError(
-                f"dim_items not found at {self.dim_items_path}. "
-                "Expected a processed dim with item_idx/movieId/title."
+                f"dim_items not found at {self.dim_items_path}."
             )
 
-        self.dim_items = pl.read_parquet(self.dim_items_path).select(
-            [c for c in ["item_idx", "movieId", "title", "poster_url"] if c in pl.read_parquet(self.dim_items_path).columns]
-        )
+        dim = pl.read_parquet(self.dim_items_path)
+        want = [c for c in ["item_idx", "movieId", "title", "poster_url"] if c in dim.columns]
+        dim = dim.select(want)
 
-        # If poster_url doesn't exist in your dim, that's okay.
-        if "poster_url" not in self.dim_items.columns:
-            self.dim_items = self.dim_items.with_columns(pl.lit(None).alias("poster_url"))
+        if "poster_url" not in dim.columns:
+            dim = dim.with_columns(pl.lit(None).alias("poster_url"))
+
+        self.dim_items = dim
 
     def _load_train_conf_aggregates(self) -> None:
         if not self.train_conf_path.exists():
@@ -206,7 +225,7 @@ class V4RecommenderService:
             df = df.with_columns(pl.lit(0).alias("days_since_last"))
             days_col = "days_since_last"
 
-        user_agg = (
+        self.user_agg = (
             df.group_by("user_idx")
             .agg(
                 pl.len().alias("user_interactions"),
@@ -217,7 +236,7 @@ class V4RecommenderService:
             .collect(streaming=True)
         )
 
-        item_agg = (
+        self.item_agg = (
             df.group_by("item_idx")
             .agg(
                 pl.len().alias("item_interactions"),
@@ -228,19 +247,25 @@ class V4RecommenderService:
             .collect(streaming=True)
         )
 
-        self.user_agg = user_agg
-        self.item_agg = item_agg
-
     def _load_ranker(self) -> None:
+        tried_ranker = [self.ranker_path]
+        tried_meta = [self.ranker_meta_path]
+
         if not self.ranker_path.exists():
             raise FileNotFoundError(
-                f"V4 ranker not found at {self.ranker_path}. "
-                "Train it first."
+                "V4 ranker not found.\n"
+                f"Split={self.cfg.split}\n"
+                f"Tried: {', '.join(str(p) for p in tried_ranker)}\n"
+                "Train it first via:\n"
+                "  python -m src.ranking.train_ranker_v4_val\n"
+                "or ensure reports/ is present in this branch."
             )
 
         if not self.ranker_meta_path.exists():
             raise FileNotFoundError(
-                f"V4 ranker meta not found at {self.ranker_meta_path}."
+                "V4 ranker meta not found.\n"
+                f"Split={self.cfg.split}\n"
+                f"Tried: {', '.join(str(p) for p in tried_meta)}"
             )
 
         self.ranker = joblib.load(self.ranker_path)
@@ -323,7 +348,7 @@ class V4RecommenderService:
         candidates = row["candidates"][0]
         n = len(candidates)
 
-        # Blend score may be missing depending on your candidate writer
+        # Score source
         if "blend_score" in cols:
             blend_score = row["blend_score"][0]
         elif "tt_scores" in cols:
@@ -331,7 +356,7 @@ class V4RecommenderService:
         else:
             blend_score = [0.0] * n
 
-        # Blend sources optional
+        # Sources
         if "blend_sources" in cols:
             blend_sources = row["blend_sources"][0]
         else:
@@ -351,7 +376,7 @@ class V4RecommenderService:
             }
         )
 
-        # Join historical aggregates
+        # Aggregates
         base = base.join(self.user_agg, on="user_idx", how="left")
         base = base.join(self.item_agg, on="item_idx", how="left")
 
@@ -425,7 +450,10 @@ class V4RecommenderService:
                 return "Popular among similar users"
             return "Recommended for you"
 
-        reasons = [pick_reason(r) for r in df.select(["has_seq", "has_tt", "has_v2"]).to_dicts()]
+        reasons = [
+            pick_reason(r)
+            for r in df.select(["has_seq", "has_tt", "has_v2"]).to_dicts()
+        ]
         return df.with_columns(pl.Series("reason", reasons))
 
     # ---------------------------
@@ -487,6 +515,7 @@ class V4RecommenderService:
         if debug:
             payload["debug"] = {
                 "split": self.cfg.split,
+                "project_root": str(PROJECT_ROOT),
                 "candidates_path": str(self.candidates_path),
                 "session_features_path": str(self.session_features_path),
                 "ranker_path": str(self.ranker_path),
