@@ -1,142 +1,170 @@
 # ui/streamlit_app.py
+
 from __future__ import annotations
 
-import json
+import time
 from typing import Any, Dict, List  # noqa: UP035
 
 import requests
 import streamlit as st
 
-DEFAULT_BASE = "http://127.0.0.1:8004"
+API_BASE_DEFAULT = "http://127.0.0.1:8004"
 PLACEHOLDER_POSTER = "https://via.placeholder.com/300x450?text=No+Poster"
 
 
-def api_get(url: str) -> Dict[str, Any]:
-    try:
-        r = requests.get(url, timeout=20)
-        return r.json()
-    except Exception as e:
-        return {"error": str(e), "url": url}
+def _get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.get(url, params=params, timeout=60)
+    r.raise_for_status()
+    return r.json()
 
 
-def api_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-        return r.json()
-    except Exception as e:
-        return {"error": str(e), "url": url, "payload": payload}
+def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(url, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
 
 
-def group_by_reason(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    buckets: Dict[str, List[Dict[str, Any]]] = {
-        "Because you watched": [],
-        "Similar to your taste": [],
-        "Popular among similar users": [],
-        "Recommended for you": [],
-    }
-
-    for it in items:
-        r = str(it.get("reason") or "Recommended for you")
-        key = r
-        if r.startswith("Because you watched"):
-            key = "Because you watched"
-        if key not in buckets:
-            buckets[key] = []
-        buckets[key].append(it)
-
-    # remove empty
-    return {k: v for k, v in buckets.items() if v}
+def _group_by_reason(recs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in recs:
+        key = r.get("reason") or "Recommended for you"
+        groups.setdefault(key, []).append(r)
+    return groups
 
 
-def render_card(base: str, split: str, user_idx: int, it: Dict[str, Any]):
-    title = it.get("title", "")
-    item_idx = it.get("item_idx")
-    poster = it.get("poster_url") or PLACEHOLDER_POSTER
-    score = it.get("score")
-    reason = it.get("reason", "")
+def _render_card(rec: Dict[str, Any], user_idx: int, api_base: str):
+    poster = rec.get("poster_url") or PLACEHOLDER_POSTER
+    title = rec.get("title") or f"Item {rec.get('item_idx')}"
+    score = rec.get("score")
 
     with st.container(border=True):
-        cols = st.columns([1, 3])
-        with cols[0]:
-            st.image(poster, use_container_width=True)
+        st.image(poster, use_container_width=True)
+        st.markdown(f"**{title}**")
+        st.caption(f"Score: {score:.4f} | {rec.get('reason')}")
 
-        with cols[1]:
-            st.markdown(f"**{title}**")
-            st.caption(f"Score: {score:.4f}" if isinstance(score, (int, float)) else f"Score: {score}")
-            st.caption(reason)
+        c1, c2, c3, c4 = st.columns(4)
+        item_idx = rec["item_idx"]
 
-            bcols = st.columns(4)
-            if bcols[0].button("Like", key=f"like-{user_idx}-{item_idx}-{reason}"):
-                api_post(f"{base}/feedback?split={split}", {"user_idx": user_idx, "item_idx": item_idx, "event": "like"})
-                st.toast("Liked")
+        def send(ev_type: str):
+            _post(f"{api_base}/feedback", {
+                "user_idx": int(user_idx),
+                "item_idx": int(item_idx),
+                "event_type": ev_type,
+            })
 
-            if bcols[1].button("Watched", key=f"watched-{user_idx}-{item_idx}-{reason}"):
-                api_post(f"{base}/feedback?split={split}", {"user_idx": user_idx, "item_idx": item_idx, "event": "watched"})
-                st.toast("Marked watched")
-
-            if bcols[2].button("Watch Later", key=f"later-{user_idx}-{item_idx}-{reason}"):
-                api_post(f"{base}/feedback?split={split}", {"user_idx": user_idx, "item_idx": item_idx, "event": "watch_later"})
-                st.toast("Added to watch later")
-
-            if bcols[3].button("Dislike", key=f"dislike-{user_idx}-{item_idx}-{reason}"):
-                api_post(f"{base}/feedback?split={split}", {"user_idx": user_idx, "item_idx": item_idx, "event": "dislike"})
-                st.toast("Disliked")
+        if c1.button("👍 Like", key=f"like_{user_idx}_{item_idx}"):
+            send("liked")
+            st.toast("Liked")
+        if c2.button("✅ Watched", key=f"watched_{user_idx}_{item_idx}"):
+            send("watched")
+            st.toast("Marked as watched")
+        if c3.button("🕒 Watch later", key=f"wl_{user_idx}_{item_idx}"):
+            send("watch_later")
+            st.toast("Added to watch later")
+        if c4.button("▶️ Start", key=f"start_{user_idx}_{item_idx}"):
+            send("started")
+            st.toast("Started watching")
 
 
 def main():
     st.set_page_config(page_title="Movie Reco MVP - V4", layout="wide")
-
     st.title("Movie Recommendation MVP - V4")
-    st.caption("Session-aware ranking + live feedback + poster cache-first rendering")
+    st.caption("Session-aware + Diversity + Live Feedback Loop")
 
     with st.sidebar:
-        base = st.text_input("API Base", value=DEFAULT_BASE)
+        st.subheader("API")
+        api_base = st.text_input("Base URL", value=API_BASE_DEFAULT)
         split = st.selectbox("Split", ["val", "test"], index=0)
-        user_idx = st.number_input("User Index", min_value=0, value=9764, step=1)
-        k = st.slider("K", min_value=5, max_value=50, value=20, step=1)
-        include_titles = st.checkbox("Include titles", value=True)
-        debug = st.checkbox("Debug", value=False)
+        apply_diversity = st.checkbox("Apply diversity", value=True)
+        debug = st.checkbox("Debug payload", value=False)
 
         st.divider()
+        st.subheader("User")
+        user_idx = st.number_input("user_idx", min_value=0, value=9764, step=1)
+        k = st.slider("Top-K", 5, 50, 20)
+
+        fetch = st.button("Get recommendations")
+
+    if "last_payload" not in st.session_state:
+        st.session_state.last_payload = None
+    if "last_fetch_ts" not in st.session_state:
+        st.session_state.last_fetch_ts = 0.0
+
+    def do_fetch():
+        payload = _get(
+            f"{api_base}/recommend",
+            {
+                "user_idx": int(user_idx),
+                "k": int(k),
+                "include_titles": True,
+                "debug": bool(debug),
+                "split": split,
+                "apply_diversity": bool(apply_diversity),
+            },
+        )
+        st.session_state.last_payload = payload
+        st.session_state.last_fetch_ts = time.time()
+
+    if fetch:
+        do_fetch()
+
+    # Auto-refresh after feedback button clicks
+    # Streamlit reruns script automatically; we can refresh if we already have payload.
+    if st.session_state.last_payload is not None and (time.time() - st.session_state.last_fetch_ts) > 0.2:
+        # light refresh hook button
         if st.button("Refresh recommendations"):
-            st.session_state["refresh_token"] = st.session_state.get("refresh_token", 0) + 1
+            do_fetch()
 
-    # Load user state (so you can see clicks are actually registered)
-    st_state = api_get(f"{base}/user_state?user_idx={user_idx}&split={split}")
-    with st.expander("Your interaction state (live)"):
-        st.json(st_state)
-
-    # Get recommendations
-    rec_url = (
-        f"{base}/recommend?"
-        f"user_idx={user_idx}&k={k}&include_titles={str(include_titles)}&debug={str(debug)}&split={split}"
-    )
-    out = api_get(rec_url)
-
-    if out.get("error") or out.get("recommend_failed"):
-        st.error("Failed to fetch recommendations.")
-        st.json(out)
+    payload = st.session_state.last_payload
+    if not payload:
+        st.info("Select user and click **Get recommendations**.")
         return
 
-    items = out.get("items", [])
-
-    if not items:
+    recs = payload.get("recommendations", [])
+    if not recs:
         st.warning("No recommendations returned for this user.")
-        st.json(out)
+        if debug and payload.get("debug"):
+            st.json(payload["debug"])
         return
 
-    # Grouped sections
-    buckets = group_by_reason(items)
+    # Group display with headings
+    groups = _group_by_reason(recs)
 
-    for heading, group in buckets.items():
-        st.subheader(heading)
-        for it in group:
-            render_card(base, split, int(user_idx), it)
+    # Keep a predictable order of key buckets
+    reason_order = [
+        "Because you watched",
+        "Similar to your taste",
+        "Popular among similar users",
+        "Recommended for you",
+    ]
 
-    if debug and out.get("debug"):
+    ordered_keys = []
+    for ro in reason_order:
+        for k_reason in groups.keys():
+            if k_reason.startswith(ro):
+                if k_reason not in ordered_keys:
+                    ordered_keys.append(k_reason)
+
+    for k_reason in groups.keys():
+        if k_reason not in ordered_keys:
+            ordered_keys.append(k_reason)
+
+    for reason in ordered_keys:
+        items = groups.get(reason, [])
+        if not items:
+            continue
+
+        st.subheader(reason)
+
+        cols = st.columns(5)
+        for i, rec in enumerate(items):
+            with cols[i % 5]:
+                _render_card(rec, user_idx=int(user_idx), api_base=api_base)
+
+    if debug and payload.get("debug"):
         st.divider()
         st.subheader("Debug")
-        st.json(out["debug"])
+        st.json(payload["debug"])
 
 
 if __name__ == "__main__":

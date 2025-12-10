@@ -1,574 +1,409 @@
 # src/service/reco_service_v4.py
+
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple  # noqa: UP035
 
-import joblib
+import numpy as np
 import polars as pl
 
-from src.service.poster_cache import PosterCache
+try:
+    import joblib
+except Exception:  # pragma: no cover
+    joblib = None
 
-# -----------------------------
-# Feedback store (lightweight)
-# -----------------------------
 
-class FeedbackStoreV4:
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _project_root() -> Path:
+    # src/service/reco_service_v4.py -> src/service -> src -> project root
+    return Path(__file__).resolve().parents[2]
+
+
+def _first_existing(paths: List[Path]) -> Optional[Path]:
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def _safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+# ---------------------------
+# Poster resolver
+# ---------------------------
+
+class PosterResolver:
     """
-    Very lightweight feedback store.
-    Keeps an in-memory state per user and appends events to a JSON file.
-    This is designed to make the V4 loop *visibly* change results
-    without retraining.
-
-    Event types we support:
-      - like
-      - watched
-      - watch_later
-      - dislike
-      - unwatch / unlike / remove_watch_later (optional)
+    Resolve posters with strict priority:
+      1) poster_cache_v4.json
+      2) item_posters.json
+      3) None
     """
-    def __init__(self, root: Path) -> None:
+
+    def __init__(self, root: Path):
         self.root = root
-        self.path = self.root / "data" / "processed" / "feedback_events_v4_live.json"
-        self.state: Dict[int, Dict[str, set[int]]] = {}
+        self.cache_path = root / "data" / "processed" / "poster_cache_v4.json"
+        self.legacy_path = root / "data" / "processed" / "item_posters.json"
 
-        self._load_existing()
+        self.cache = _load_json(self.cache_path)
+        self.legacy = _load_json(self.legacy_path)
 
-    def _load_existing(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            raw = json.loads(self.path.read_text())
-            # Accept either:
-            # 1) {"events":[...]} style
-            # 2) [{...},{...}] style
-            if isinstance(raw, dict) and "events" in raw:
-                events = raw["events"]
-            else:
-                events = raw
+        # Normalize keys to str for movieId
+        self.cache = {str(k): v for k, v in self.cache.items()} if self.cache else {}
+        self.legacy = {str(k): v for k, v in self.legacy.items()} if self.legacy else {}
 
-            if not isinstance(events, list):
-                return
-
-            for e in events:
-                try:
-                    self.record_event(
-                        user_idx=int(e["user_idx"]),
-                        item_idx=int(e["item_idx"]),
-                        event=str(e["event"]),
-                        persist=False,
-                        ts=float(e.get("ts", time.time()))
-                    )
-                except Exception:
-                    continue
-        except Exception:
-            # If file is corrupt, ignore to keep service alive
-            return
-
-    def _ensure_user(self, user_idx: int) -> Dict[str, set[int]]:
-        if user_idx not in self.state:
-            self.state[user_idx] = {
-                "like": set(),
-                "watched": set(),
-                "watch_later": set(),
-                "dislike": set(),
-            }
-        return self.state[user_idx]
-
-    def record_event(
-        self,
-        user_idx: int,
-        item_idx: int,
-        event: str,
-        persist: bool = True,
-        ts: Optional[float] = None
-    ) -> None:
-        ts = float(ts or time.time())
-        s = self._ensure_user(user_idx)
-
-        # Normalize event
-        ev = event.strip().lower()
-
-        if ev in ("like", "liked"):
-            s["like"].add(item_idx)
-            s["dislike"].discard(item_idx)
-
-        elif ev in ("watched", "watch"):
-            s["watched"].add(item_idx)
-            s["watch_later"].discard(item_idx)
-
-        elif ev in ("watch_later", "later"):
-            s["watch_later"].add(item_idx)
-
-        elif ev in ("dislike", "skip"):
-            s["dislike"].add(item_idx)
-            s["like"].discard(item_idx)
-            s["watch_later"].discard(item_idx)
-
-        elif ev in ("unlike", "remove_like"):
-            s["like"].discard(item_idx)
-
-        elif ev in ("unwatch", "remove_watched"):
-            s["watched"].discard(item_idx)
-
-        elif ev in ("remove_watch_later", "unlater"):
-            s["watch_later"].discard(item_idx)
-
-        # Persist as a simple list file
-        if persist:
-            self._append_event_file(
-                {"user_idx": user_idx, "item_idx": item_idx, "event": ev, "ts": ts}
-            )
-
-    def _append_event_file(self, event: Dict[str, Any]) -> None:
-        # Keep it simple: store as {"events":[...]} to avoid JSONL complexity.
-        # Small scale MVP.
-        try:
-            if self.path.exists():
-                raw = json.loads(self.path.read_text())
-                if isinstance(raw, dict) and isinstance(raw.get("events"), list):
-                    raw["events"].append(event)
-                elif isinstance(raw, list):
-                    raw.append(event)
-                    raw = {"events": raw}
-                else:
-                    raw = {"events": [event]}
-            else:
-                raw = {"events": [event]}
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(raw, ensure_ascii=False, indent=2))
-        except Exception:
-            # Never crash the recommender because feedback persistence failed
-            pass
-
-    def get_state(self, user_idx: int) -> Dict[str, List[int]]:
-        s = self._ensure_user(user_idx)
-        return {
-            "like": sorted(list(s["like"])),
-            "watched": sorted(list(s["watched"])),
-            "watch_later": sorted(list(s["watch_later"])),
-            "dislike": sorted(list(s["dislike"])),
-        }
+    def get(self, movie_id: Optional[int]) -> Optional[str]:
+        if movie_id is None:
+            return None
+        key = str(movie_id)
+        if key in self.cache:
+            return self.cache[key]
+        if key in self.legacy:
+            return self.legacy[key]
+        return None
 
 
-# -----------------------------
+# ---------------------------
 # Config
-# -----------------------------
+# ---------------------------
 
 @dataclass
 class V4ServiceConfig:
-    split: str = "val"  # val | test
-    k_default: int = 20
+    split: str = "val"  # "val" | "test"
     project_root: Optional[Path] = None
-
-    # Optional overrides if you want:
-    candidates_path: Optional[Path] = None
-    session_features_path: Optional[Path] = None
-    item_meta_path: Optional[Path] = None
-    ranker_path: Optional[Path] = None
-    ranker_meta_path: Optional[Path] = None
-
-    def resolve_root(self) -> Path:
-        if self.project_root:
-            return self.project_root
-        # src/service/reco_service_v4.py -> src/service -> src -> project root
-        return Path(__file__).resolve().parents[2]
+    k_default: int = 20
+    candidates_version: str = "v3"  # candidates still from V3 blend
 
 
-# -----------------------------
+# ---------------------------
 # Service
-# -----------------------------
+# ---------------------------
 
 class V4RecommenderService:
     """
-    V4 objective:
-      - Use V3 blended candidate pool
-      - Add session-aware features (short-term boost + hot/warm/cold flags)
-      - Keep the V3 live feedback loop experience
-      - Provide stable API outputs for UI
+    V4 = V3 hybrid candidates + session-aware features + lightweight diversity
+         + *live feedback-aware reranking* (local file-backed).
+
+    Key robustness choice:
+    - Session features are injected as per-user scalar literals to avoid
+      lazy join schema issues (fixes the _pos dtype crash).
     """
 
-    def __init__(self, config: V4ServiceConfig) -> None:
+    def __init__(self, config: V4ServiceConfig):
         self.config = config
-        self.root = config.resolve_root()
+        self.root = config.project_root or _project_root()
 
-        self.split = (config.split or "val").lower().strip()
-        if self.split not in ("val", "test"):
-            self.split = "val"
+        self.data_dir = self.root / "data"
+        self.proc = self.data_dir / "processed"
+        self.reports = self.root / "reports"
 
-        # Paths
-        self.candidates_path = (
-            config.candidates_path
-            or self.root / "data" / "processed" / f"v3_candidates_{self.split}.parquet"
-        )
-        self.session_features_path = (
-            config.session_features_path
-            or self.root / "data" / "processed" / f"session_features_v4_{self.split}.parquet"
-        )
-        self.item_meta_path = (
-            config.item_meta_path
-            or self.root / "data" / "processed" / "item_meta.parquet"
-        )
+        self.poster_resolver = PosterResolver(self.root)
 
-        self.ranker_path = (
-            config.ranker_path
-            or self.root / "reports" / "models" / f"ranker_hgb_v4_{self.split}.pkl"
-        )
-        self.ranker_meta_path = (
-            config.ranker_meta_path
-            or self.root / "reports" / "models" / f"ranker_hgb_v4_{self.split}.meta.json"
-        )
+        self._load_candidates()
+        self._load_session_features()
+        self._load_item_meta()
+        self._load_user_item_features()
+        self._load_ranker()
 
-        # Core data
-        self.poster_cache = PosterCache(self.root)
-        self.feedback = FeedbackStoreV4(self.root)
+        # Feedback store (lightweight)
+        self.feedback_path = self.proc / "feedback_events_v4.jsonl"
+        self._feedback_state = {
+            "liked": {},
+            "watched": {},
+            "watch_later": {},
+            "started": {},
+            "disliked": {},
+        }
+        self._load_feedback_state()
 
-        self._item_meta = self._load_item_meta()
-        self._session_feats = self._load_session_features()
-
-        self._ranker, self._feature_order, self._model_auc = self._load_ranker()
-
-        # We keep candidates lazy to avoid repeated huge loads.
-        self._cand_lf = self._load_candidates_lazy()
-
-    # -----------------------------
+    # ---------------------------
     # Loaders
-    # -----------------------------
+    # ---------------------------
 
-    def _load_item_meta(self) -> pl.DataFrame:
-        if not self.item_meta_path.exists():
-            # Minimal fallback to keep UI alive
-            return pl.DataFrame(
-                {"item_idx": [], "movieId": [], "title": []},
-                schema={"item_idx": pl.Int64, "movieId": pl.Int64, "title": pl.Utf8},
-            )
-        df = pl.read_parquet(self.item_meta_path)
-        # normalize cols
-        cols = set(df.columns)
-        if "item_idx" not in cols:
-            # attempt to infer
-            if "itemId" in cols:
-                df = df.rename({"itemId": "item_idx"})
-        if "movieId" not in cols:
-            df = df.with_columns(pl.lit(None).cast(pl.Int64).alias("movieId"))
-        if "title" not in cols:
-            df = df.with_columns(pl.lit("").alias("title"))
-        return df.select([c for c in ["item_idx", "movieId", "title"] if c in df.columns])
+    def _load_candidates(self) -> None:
+        split = self.config.split
+        cand_path = self.proc / f"{self.config.candidates_version}_candidates_{split}.parquet"
+        if not cand_path.exists():
+            # also try v3_candidates_{split}.parquet (most likely)
+            cand_path = self.proc / f"v3_candidates_{split}.parquet"
 
-    def _load_session_features(self) -> pl.DataFrame:
-        if not self.session_features_path.exists():
-            return pl.DataFrame(
-                {
-                    "user_idx": [],
-                    "last_item_idx": [],
-                    "last_title": [],
-                    "last_seq_len": [],
-                    "short_term_boost": [],
-                    "session_recency_bucket": [],
-                }
-            )
-        return pl.read_parquet(self.session_features_path)
-
-    def _load_ranker(self):
-        if not self.ranker_path.exists() or not self.ranker_meta_path.exists():
+        if not cand_path.exists():
             raise FileNotFoundError(
-                "V4 ranker not found.\n"
-                f"Split={self.split}\n"
-                f"Tried: {self.ranker_path}\n"
-                "Train it first via:\n"
-                "  python -m src.ranking.train_ranker_v4_val\n"
-                "  python -m src.ranking.train_ranker_v4_test\n"
+                f"Candidates not found for split={split}. "
+                f"Tried: {cand_path}"
             )
 
-        ranker = joblib.load(self.ranker_path)
-        meta = json.loads(self.ranker_meta_path.read_text())
-        feature_order = meta.get("features", [])
-        model_auc = float(meta.get("auc", 0.0))
-        return ranker, feature_order, model_auc
+        self.candidates_path = cand_path
+        self.cand_df = pl.read_parquet(cand_path)
 
-    def _load_candidates_lazy(self) -> pl.LazyFrame:
-        if not self.candidates_path.exists():
-            # keep empty LF
-            return pl.LazyFrame(
-                schema={
-                    "user_idx": pl.Int64,
-                    "candidates": pl.List(pl.Int64),
-                }
-            )
-        return pl.scan_parquet(self.candidates_path)
+        # We expect columns: user_idx, candidates, blend_score, blend_sources
+        # Be defensive about missing blend_score
+        cols = set(self.cand_df.columns)
+        if "blend_score" not in cols:
+            # create empty blend_score list with zeros later per user
+            pass
 
-    # -----------------------------
-    # Helpers
-    # -----------------------------
+    def _load_session_features(self) -> None:
+        split = self.config.split
+        sess_path = self.proc / f"session_features_v4_{split}.parquet"
 
-    def _get_user_candidate_row(self, user_idx: int) -> pl.DataFrame:
-        lf = self._cand_lf.filter(pl.col("user_idx") == user_idx)
-        df = lf.collect()
-        return df
-
-    def _get_session_row(self, user_idx: int) -> Optional[dict]:
-        if self._session_feats.is_empty():
-            return None
-        try:
-            row = (
-                self._session_feats
-                .filter(pl.col("user_idx") == user_idx)
-                .head(1)
-            )
-            if row.height == 0:
-                return None
-            return row.to_dicts()[0]
-        except Exception:
-            return None
-
-    def _resolve_title(self, item_idx: int) -> str:
-        if self._item_meta.is_empty():
-            return ""
-        try:
-            r = self._item_meta.filter(pl.col("item_idx") == item_idx).head(1)
-            if r.height == 0:
-                return ""
-            return str(r["title"][0])
-        except Exception:
-            return ""
-
-    def _resolve_movie_id(self, item_idx: int) -> Optional[int]:
-        if self._item_meta.is_empty():
-            return None
-        try:
-            r = self._item_meta.filter(pl.col("item_idx") == item_idx).head(1)
-            if r.height == 0:
-                return None
-            v = r["movieId"][0]
-            return int(v) if v is not None else None
-        except Exception:
-            return None
-
-    def _resolve_poster_url(self, item_idx: int) -> Optional[str]:
-        # Cache-first:
-        mid = self._resolve_movie_id(item_idx)
-        if mid is not None:
-            url = self.poster_cache.get_by_movie_id(mid)
-            if url:
-                return url
-
-        # Fallback to item_idx keyed caches (if any)
-        url = self.poster_cache.get_by_item_idx(item_idx)
-        if url:
-            return url
-
-        return None
-
-    def _derive_source_flags(self, blend_sources: Optional[List[str]]) -> Tuple[int, int, int]:
-        if not blend_sources:
-            return 0, 0, 0
-        # blend_sources entries might be like "two_tower_ann,v2_prior"
-        joined = ",".join(blend_sources).lower()
-        has_tt = 1 if ("two_tower" in joined or "tt" in joined or "ann" in joined) else 0
-        has_seq = 1 if ("seq" in joined or "gru" in joined) else 0
-        has_v2 = 1 if ("v2" in joined or "prior" in joined) else 0
-        return has_tt, has_seq, has_v2
-
-    def _ensure_feature_order(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Add any missing features in meta with safe defaults.
-        """
-        if not self._feature_order:
-            return df
-
-        existing = set(df.columns)
-        to_add = []
-        for f in self._feature_order:
-            if f not in existing:
-                # default numeric
-                to_add.append(pl.lit(0.0).alias(f))
-        if to_add:
-            df = df.with_columns(to_add)
-
-        # Cast ints/bools to numeric if needed
-        # Keep ordering strict
-        cols = [c for c in self._feature_order if c in df.columns]
-        return df.select(cols)
-
-    # -----------------------------
-    # Core V4 scoring
-    # -----------------------------
-
-    def _build_base_frame(self, user_idx: int) -> pl.DataFrame:
-        cand_row = self._get_user_candidate_row(user_idx)
-        if cand_row.height == 0:
-            return pl.DataFrame(
-                {"user_idx": [], "item_idx": [], "blend_score": [], "blend_sources": []}
+        # Your run showed test uses val sequences; still file should exist now
+        if not sess_path.exists():
+            raise FileNotFoundError(
+                f"Session features not found for split={split}: {sess_path}"
             )
 
-        # Normalize columns
-        cols = cand_row.columns
-        if "candidates" not in cols:
-            # defensive: some earlier variants use candidates_v3
-            for alt in ("candidates_v3", "items", "item_idx_list"):
+        self.session_path = sess_path
+        self.sess_df = pl.read_parquet(sess_path).select(
+            ["user_idx", "last_item_idx", "last_title", "last_seq_len",
+             "short_term_boost", "session_recency_bucket"]
+        )
+
+        # Build a tiny dict for instant per-user lookup
+        # Avoid joins inside recommend
+        self.sess_map: Dict[int, Dict[str, Any]] = {}
+        for row in self.sess_df.iter_rows(named=True):
+            uid = _safe_int(row["user_idx"])
+            self.sess_map[uid] = row
+
+    def _load_item_meta(self) -> None:
+        # We rely on the file you confirmed exists
+        meta_path = self.proc / "item_meta.parquet"
+        if not meta_path.exists():
+            # fallback candidates
+            meta_path = _first_existing([
+                self.proc / "movies_enriched.parquet",
+                self.proc / "items.parquet",
+                self.data_dir / "raw" / "movies.csv",
+            ]) or meta_path
+
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                "Could not locate item metadata for titles/posters. "
+                "Expected data/processed/item_meta.parquet."
+            )
+
+        self.item_meta_path = meta_path
+        df = pl.read_parquet(meta_path) if meta_path.suffix == ".parquet" else pl.read_csv(meta_path)
+
+        # Normalize expected column names
+        cols = set(df.columns)
+
+        # Must have item_idx
+        if "item_idx" not in cols:
+            # try infer from "itemId" or "idx"
+            for alt in ["itemId", "idx"]:
                 if alt in cols:
-                    cand_row = cand_row.rename({alt: "candidates"})
+                    df = df.rename({alt: "item_idx"})
+                    cols = set(df.columns)
                     break
 
-        if "blend_score" not in cols:
-            # might be tt_scores or something else
-            if "tt_scores" in cols:
-                cand_row = cand_row.rename({"tt_scores": "blend_score"})
-            else:
-                cand_row = cand_row.with_columns(
-                    pl.lit([]).cast(pl.List(pl.Float64)).alias("blend_score")
-                )
+        # Must have title
+        if "title" not in cols:
+            for alt in ["movie_title", "name"]:
+                if alt in cols:
+                    df = df.rename({alt: "title"})
+                    cols = set(df.columns)
+                    break
 
-        if "blend_sources" not in cols:
-            # may not exist in early blends
-            cand_row = cand_row.with_columns(
-                pl.lit([]).cast(pl.List(pl.Utf8)).alias("blend_sources")
+        # Must have movieId if available
+        if "movieId" not in cols:
+            for alt in ["movie_id", "tmdb_movie_id", "movielens_id"]:
+                if alt in cols:
+                    df = df.rename({alt: "movieId"})
+                    cols = set(df.columns)
+                    break
+
+        # Keep minimal set
+        keep = [c for c in ["item_idx", "movieId", "title"] if c in df.columns]
+        self.item_meta = df.select(keep).unique(subset=["item_idx"])
+
+        # Build dict for quick title/movieId lookup
+        self.item_meta_map: Dict[int, Dict[str, Any]] = {}
+        for row in self.item_meta.iter_rows(named=True):
+            self.item_meta_map[int(row["item_idx"])] = row
+
+    def _load_user_item_features(self) -> None:
+        # These files should already exist from earlier pipelines.
+        # We keep robust fallbacks.
+        user_feat_path = _first_existing([
+            self.proc / "user_features.parquet",
+            self.proc / "user_feat.parquet",
+        ])
+        item_feat_path = _first_existing([
+            self.proc / "item_features.parquet",
+            self.proc / "item_feat.parquet",
+        ])
+
+        self.user_feat = pl.read_parquet(user_feat_path) if user_feat_path else None
+        self.item_feat = pl.read_parquet(item_feat_path) if item_feat_path else None
+
+    def _load_ranker(self) -> None:
+        if joblib is None:
+            raise RuntimeError("joblib not available in environment.")
+
+        split = self.config.split
+        model_path = self.reports / "models" / f"ranker_hgb_v4_{split}.pkl"
+        meta_path = self.reports / "models" / f"ranker_hgb_v4_{split}.meta.json"
+
+        if not model_path.exists():
+            raise FileNotFoundError(
+                "V4 ranker not found.\n"
+                f"Split={split}\n"
+                f"Tried: {model_path}\n"
+                "Train it first via:\n"
+                f"  python -m src.ranking.train_ranker_v4_{split}"
             )
 
-        # Ensure list lengths align by safest strategy:
-        # explode candidates alone, then left-attach scores/sources by index if present.
-        # But in our V3 files, explode(["candidates","blend_score","blend_sources"]) usually works.
-        # We'll handle mismatch gracefully using list.get with row_count.
+        self.ranker_path = model_path
+        self.ranker_meta_path = meta_path if meta_path.exists() else None
 
-        # Add row_count for safe alignment
-        cand_row = cand_row.with_columns(pl.lit(user_idx).alias("user_idx"))
+        self.model = joblib.load(model_path)
 
-        # Explode candidates
-        exploded = cand_row.select(["user_idx", "candidates", "blend_score", "blend_sources"]).explode("candidates")
-        exploded = exploded.rename({"candidates": "item_idx"})
+        self.model_auc = None
+        self.feature_order: List[str] = []
+        if self.ranker_meta_path and self.ranker_meta_path.exists():
+            meta = json.loads(self.ranker_meta_path.read_text())
+            self.model_auc = meta.get("auc")
+            self.feature_order = meta.get("features", [])
+        else:
+            # fallback if meta missing
+            self.feature_order = [
+                "blend_score", "has_tt", "has_seq", "has_v2",
+                "short_term_boost", "sess_hot", "sess_warm", "sess_cold",
+                "user_interactions", "user_conf_sum", "user_conf_decay_sum",
+                "user_days_since_last",
+                "item_interactions", "item_conf_sum", "item_conf_decay_sum",
+                "item_days_since_last",
+            ]
 
-        # If blend_score is a list and same length, we can try a parallel explode
-        # but that can fail on dtype mismatch. We'll rebuild safely:
-        # create an index per user row
-        exploded = exploded.with_columns(pl.int_range(0, pl.len()).alias("_pos"))
+    # ---------------------------
+    # Feedback state
+    # ---------------------------
 
-        # Fetch original lists
-        orig = cand_row.select(["blend_score", "blend_sources"]).to_dicts()[0]
-        score_list = orig.get("blend_score") or []
-        src_list = orig.get("blend_sources") or []
+    def _load_feedback_state(self) -> None:
+        if not self.feedback_path.exists():
+            return
 
-        # Create small helper frames from python lists for alignment
-        s_df = pl.DataFrame({"_pos": list(range(len(score_list))), "blend_score": score_list})
-        b_df = pl.DataFrame({"_pos": list(range(len(src_list))), "blend_sources": src_list})
+        # Load historical events and fold into sets
+        for line in self.feedback_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
 
-        exploded = exploded.join(s_df, on="_pos", how="left").join(b_df, on="_pos", how="left")
+            uid = _safe_int(ev.get("user_idx"))
+            it = _safe_int(ev.get("item_idx"))
+            et = ev.get("event_type")
 
-        # Fill missing blend_score
-        exploded = exploded.with_columns(
-            pl.col("blend_score").fill_null(0.0).cast(pl.Float64)
-        )
+            if uid <= 0 and uid != 0:
+                continue
+            if it < 0:
+                continue
 
-        return exploded.drop("_pos")
+            self._apply_event_to_state(uid, it, et)
 
-    def _attach_session_features(self, base: pl.DataFrame, user_idx: int) -> pl.DataFrame:
-        sess = self._get_session_row(user_idx)
-        if not sess:
-            return base.with_columns(
-                [
-                    pl.lit(0.0).alias("short_term_boost"),
-                    pl.lit(0).alias("sess_hot"),
-                    pl.lit(0).alias("sess_warm"),
-                    pl.lit(0).alias("sess_cold"),
-                ]
-            )
+    def _apply_event_to_state(self, user_idx: int, item_idx: int, event_type: str) -> None:
+        if event_type not in self._feedback_state:
+            return
 
-        bucket = str(sess.get("session_recency_bucket", "") or "").lower()
+        bucket = self._feedback_state[event_type]
+        if user_idx not in bucket:
+            bucket[user_idx] = set()
+        bucket[user_idx].add(item_idx)
+
+    def record_feedback(self, user_idx: int, item_idx: int, event_type: str) -> Dict[str, Any]:
+        event_type = event_type.strip().lower()
+        if event_type not in self._feedback_state:
+            return {"ok": False, "error": "unknown_event_type", "event_type": event_type}
+
+        ev = {
+            "user_idx": int(user_idx),
+            "item_idx": int(item_idx),
+            "event_type": event_type,
+        }
+
+        # Append to file
+        self.feedback_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.feedback_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(ev) + "\n")
+
+        # Update in-memory
+        self._apply_event_to_state(int(user_idx), int(item_idx), event_type)
+
+        return {"ok": True, "event": ev}
+
+    # ---------------------------
+    # Core recommend
+    # ---------------------------
+
+    def _get_user_candidate_row(self, user_idx: int) -> Optional[Dict[str, Any]]:
+        df = self.cand_df.filter(pl.col("user_idx") == int(user_idx))
+        if df.height == 0:
+            return None
+        return df.row(0, named=True)
+
+    def _derive_source_flags(self, sources: List[str]) -> Tuple[List[int], List[int], List[int]]:
+        has_tt, has_seq, has_v2 = [], [], []
+        for s in sources:
+            s = (s or "").lower()
+            has_tt.append(1 if "two_tower" in s or "tt" in s else 0)
+            has_seq.append(1 if "seq" in s or "gru" in s else 0)
+            has_v2.append(1 if "v2" in s or "prior" in s else 0)
+        return has_tt, has_seq, has_v2
+
+    def _session_literals(self, user_idx: int, n: int) -> Dict[str, Any]:
+        s = self.sess_map.get(int(user_idx))
+        if not s:
+            # cold defaults
+            return {
+                "short_term_boost": [0.0] * n,
+                "sess_hot": [0] * n,
+                "sess_warm": [0] * n,
+                "sess_cold": [1] * n,
+                "last_item_idx": None,
+                "last_title": None,
+                "session_recency_bucket": "cold",
+            }
+
+        bucket = (s.get("session_recency_bucket") or "cold").lower()
         hot = 1 if bucket == "hot" else 0
         warm = 1 if bucket == "warm" else 0
         cold = 1 if bucket == "cold" else 0
-        stb = float(sess.get("short_term_boost", 0.0) or 0.0)
 
-        return base.with_columns(
-            [
-                pl.lit(stb).alias("short_term_boost"),
-                pl.lit(hot).alias("sess_hot"),
-                pl.lit(warm).alias("sess_warm"),
-                pl.lit(cold).alias("sess_cold"),
-            ]
-        )
+        stb = float(s.get("short_term_boost") or 0.0)
 
-    def _attach_source_flags(self, base: pl.DataFrame) -> pl.DataFrame:
-        # blend_sources might be null scalar per row; convert to list[str] or empty
-        # We'll derive flags row-wise using a Python apply for robustness.
-        def _flags(x):
-            if x is None:
-                return (0, 0, 0)
-            if isinstance(x, str):
-                lst = [x]
-            else:
-                lst = list(x) if isinstance(x, (list, tuple)) else []
-            return self._derive_source_flags(lst)
+        return {
+            "short_term_boost": [stb] * n,
+            "sess_hot": [hot] * n,
+            "sess_warm": [warm] * n,
+            "sess_cold": [cold] * n,
+            "last_item_idx": s.get("last_item_idx"),
+            "last_title": s.get("last_title"),
+            "session_recency_bucket": bucket,
+        }
 
-        return base.with_columns(
-            [
-                pl.col("blend_sources").map_elements(lambda x: _flags(x)[0], return_dtype=pl.Int8).alias("has_tt"),
-                pl.col("blend_sources").map_elements(lambda x: _flags(x)[1], return_dtype=pl.Int8).alias("has_seq"),
-                pl.col("blend_sources").map_elements(lambda x: _flags(x)[2], return_dtype=pl.Int8).alias("has_v2"),
-            ]
-        )
-
-    def _score_with_ranker(self, feat_df: pl.DataFrame) -> List[float]:
-        # Ensure strict feature order and defaults
-        X = self._ensure_feature_order(feat_df)
-
-        # Convert to pandas for sklearn
-        pd_df = X.to_pandas()
-        scores = self._ranker.predict_proba(pd_df)[:, 1].tolist()
-        return [float(s) for s in scores]
-
-    def _build_feature_frame(self, user_idx: int) -> pl.DataFrame:
-        base = self._build_base_frame(user_idx)
-        if base.is_empty():
-            return base
-
-        base = self._attach_session_features(base, user_idx)
-        base = self._attach_source_flags(base)
-
-        # If user/item features exist from earlier steps, try to load them.
-        # Otherwise leave zeros (we'll add missing columns later).
-        # We keep this ultra-defensive to avoid breaking your branch.
-        user_feat_path = self.root / "data" / "processed" / "user_features.parquet"
-        item_feat_path = self.root / "data" / "processed" / "item_features.parquet"
-
-        if user_feat_path.exists():
-            try:
-                uf = pl.read_parquet(user_feat_path)
-                base = base.join(uf, on="user_idx", how="left")
-            except Exception:
-                pass
-
-        if item_feat_path.exists():
-            try:
-                itf = pl.read_parquet(item_feat_path)
-                base = base.join(itf, on="item_idx", how="left")
-            except Exception:
-                pass
-
-        # Fill known numeric nulls
-        for col in [
-            "user_interactions", "user_conf_sum", "user_conf_decay_sum", "user_days_since_last",
-            "item_interactions", "item_conf_sum", "item_conf_decay_sum", "item_days_since_last",
-        ]:
-            if col in base.columns:
-                base = base.with_columns(
-                    pl.col(col).fill_null(0.0)
-                )
-
-        return base
-
-    # -----------------------------
-    # Why-this generator
-    # -----------------------------
-
-    def _why_this(self, row: dict, last_title: Optional[str]) -> str:
-        # Session-aware reason first if seq context exists
-        has_seq = int(row.get("has_seq", 0) or 0)
-        has_tt = int(row.get("has_tt", 0) or 0)
-        has_v2 = int(row.get("has_v2", 0) or 0)
-
+    def _why_this(self, has_seq: int, has_tt: int, has_v2: int, last_title: Optional[str]) -> str:
         if has_seq == 1 and last_title:
             return f"Because you watched {last_title} recently"
         if has_tt == 1:
@@ -577,173 +412,284 @@ class V4RecommenderService:
             return "Popular among similar users"
         return "Recommended for you"
 
-    # -----------------------------
-    # Simple diversity interleaver
-    # -----------------------------
+    def _attach_user_item_features(self, base: pl.DataFrame) -> pl.DataFrame:
+        out = base
 
-    def _interleave_by_reason(self, items: List[dict], k: int) -> List[dict]:
-        buckets: Dict[str, List[dict]] = {}
-        order_pref = [
-            "Because you watched",  # prefix match
-            "Similar to your taste",
-            "Popular among similar users",
-            "Recommended for you",
-        ]
+        if self.user_feat is not None:
+            out = out.join(self.user_feat, on="user_idx", how="left")
+        if self.item_feat is not None:
+            out = out.join(self.item_feat, on="item_idx", how="left")
 
-        for it in items:
-            r = str(it.get("reason") or "Recommended for you")
-            key = r
-            # normalize the seq reason prefix
-            if r.startswith("Because you watched"):
-                key = "Because you watched"
-            buckets.setdefault(key, []).append(it)
+        # Fill numeric nulls
+        for c in out.columns:
+            if c in {"user_idx", "item_idx", "blend_sources"}:
+                continue
+            if out[c].dtype in (pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+                out = out.with_columns(pl.col(c).fill_null(0))
+        return out
 
-        out: List[dict] = []
-        idx = 0
-        # round-robin across preferred order
-        while len(out) < k:
-            progressed = False
-            for pref in order_pref:
-                if pref in buckets and buckets[pref]:
-                    out.append(buckets[pref].pop(0))
-                    progressed = True
-                    if len(out) >= k:
-                        break
-            if not progressed:
-                # dump remaining
-                for kk in list(buckets.keys()):
-                    while buckets[kk] and len(out) < k:
-                        out.append(buckets[kk].pop(0))
-                break
-            idx += 1
+    def _score_with_ranker(self, feats: pl.DataFrame) -> np.ndarray:
+        # Ensure feature order exists
+        missing = [c for c in self.feature_order if c not in feats.columns]
+        if missing:
+            # Create missing numeric columns as zeros
+            feats = feats.with_columns([pl.lit(0).alias(c) for c in missing])
 
-        return out[:k]
+        X = feats.select(self.feature_order).to_numpy()
 
-    # -----------------------------
-    # Public API
-    # -----------------------------
+        # HGB supports predict_proba
+        if hasattr(self.model, "predict_proba"):
+            return self.model.predict_proba(X)[:, 1]
+        # fallback
+        if hasattr(self.model, "predict"):
+            return self.model.predict(X)
+        return np.zeros((X.shape[0],), dtype=np.float32)
 
-    def record_feedback(self, user_idx: int, item_idx: int, event: str) -> Dict[str, Any]:
-        self.feedback.record_event(user_idx=user_idx, item_idx=item_idx, event=event)
-        return {"ok": True, "user_idx": int(user_idx), "item_idx": int(item_idx), "event": event}
+    def _apply_feedback_adjustments(
+        self, user_idx: int, item_ids: List[int], scores: np.ndarray
+    ) -> np.ndarray:
+        uid = int(user_idx)
 
-    def get_user_state(self, user_idx: int) -> Dict[str, Any]:
-        return self.feedback.get_state(user_idx)
+        liked = self._feedback_state["liked"].get(uid, set())
+        watched = self._feedback_state["watched"].get(uid, set())
+        watch_later = self._feedback_state["watch_later"].get(uid, set())
+        started = self._feedback_state["started"].get(uid, set())
+        disliked = self._feedback_state["disliked"].get(uid, set())
+
+        adj = scores.astype(np.float64).copy()
+
+        for i, it in enumerate(item_ids):
+            if it in disliked:
+                adj[i] -= 1.0
+            if it in watched:
+                adj[i] -= 0.5
+            if it in liked:
+                adj[i] += 0.05
+            if it in started:
+                adj[i] += 0.03
+            if it in watch_later:
+                adj[i] += 0.02
+
+        return adj
+
+    def _filter_watched(self, user_idx: int, item_ids: List[int], scores: np.ndarray) -> Tuple[List[int], np.ndarray]:
+        uid = int(user_idx)
+        watched = self._feedback_state["watched"].get(uid, set())
+        if not watched:
+            return item_ids, scores
+
+        keep_items, keep_scores = [], []
+        for it, sc in zip(item_ids, scores):
+            if it not in watched:
+                keep_items.append(it)
+                keep_scores.append(sc)
+        return keep_items, np.asarray(keep_scores)
+
+    def _simple_source_diversity(
+        self,
+        rows: List[Dict[str, Any]],
+        k: int,
+        max_streak: int = 3
+    ) -> List[Dict[str, Any]]:
+        """
+        Greedy reorder to avoid long streaks of identical primary reason bucket.
+        This is lightweight and doesn't need genre metadata.
+        """
+        if len(rows) <= 1:
+            return rows[:k]
+
+        def bucket(r: Dict[str, Any]) -> str:
+            # Use 'reason' string as bucket
+            return (r.get("reason") or "other").lower()
+
+        remaining = rows[:]
+        out: List[Dict[str, Any]] = []
+        streak = 0
+        last_b = None
+
+        while remaining and len(out) < k:
+            # Try pick best item that won't violate streak
+            picked_idx = None
+            for i, r in enumerate(remaining):
+                b = bucket(r)
+                if last_b is None or b != last_b or streak < max_streak:
+                    picked_idx = i
+                    break
+
+            if picked_idx is None:
+                picked_idx = 0
+
+            r = remaining.pop(picked_idx)
+            b = bucket(r)
+
+            if last_b is None or b != last_b:
+                last_b = b
+                streak = 1
+            else:
+                streak += 1
+
+            out.append(r)
+
+        return out
 
     def recommend(
         self,
         user_idx: int,
-        k: int = 20,
+        k: Optional[int] = None,
         include_titles: bool = True,
-        debug: bool = False
+        debug: bool = False,
+        apply_diversity: bool = True,
     ) -> Dict[str, Any]:
-        user_idx = int(user_idx)
-        k = int(k)
+        k = int(k or self.config.k_default)
 
-        base = self._build_feature_frame(user_idx)
-        if base.is_empty():
-            out = {"user_idx": user_idx, "k": k, "items": [], "split": self.split}
-            if debug:
-                out["debug"] = {"split": self.split, "candidates_path": str(self.candidates_path)}
-            return out
+        row = self._get_user_candidate_row(user_idx)
+        if row is None:
+            return {
+                "user_idx": int(user_idx),
+                "k": k,
+                "split": self.config.split,
+                "recommendations": [],
+                "debug": {"reason": "user_not_in_candidates"} if debug else None,
+            }
 
-        # Get last title for why-this
-        sess_row = self._get_session_row(user_idx)
-        last_title = None
-        if sess_row:
-            last_title = str(sess_row.get("last_title") or "") or None
+        candidates: List[int] = list(row.get("candidates") or [])
+        sources: List[str] = list(row.get("blend_sources") or [])
 
-        # Score with ranker
-        scores = self._score_with_ranker(base)
+        # blend_score list may be absent in some older files
+        blend_scores = row.get("blend_score")
+        if blend_scores is None:
+            blend_scores = [0.0] * len(candidates)
+        else:
+            blend_scores = list(blend_scores)
 
-        # Build item dicts
-        rows = base.to_dicts()
-        items: List[dict] = []
-        state = self.feedback.get_state(user_idx)
-        watched_set = set(state["watched"])
-        dislike_set = set(state["dislike"])
+        # Align lengths defensively
+        n = min(len(candidates), len(sources), len(blend_scores))
+        candidates = candidates[:n]
+        sources = sources[:n]
+        blend_scores = blend_scores[:n]
 
-        for row, sc in zip(rows, scores):
-            item_idx = int(row.get("item_idx"))
-            if item_idx in watched_set or item_idx in dislike_set:
-                continue
+        if n == 0:
+            return {
+                "user_idx": int(user_idx),
+                "k": k,
+                "split": self.config.split,
+                "recommendations": [],
+                "debug": {"reason": "empty_candidate_list"} if debug else None,
+            }
 
-            # Session boost in post-score for visible effect
-            stb = float(row.get("short_term_boost") or 0.0)
-            sess_hot = int(row.get("sess_hot") or 0)
+        has_tt, has_seq, has_v2 = self._derive_source_flags(sources)
 
-            # Mild bump if hot
-            final_sc = float(sc + (0.02 * stb) + (0.01 * sess_hot))
+        sess_lit = self._session_literals(user_idx, n)
 
-            title = self._resolve_title(item_idx) if include_titles else ""
-            movie_id = self._resolve_movie_id(item_idx)
+        base = pl.DataFrame({
+            "user_idx": [int(user_idx)] * n,
+            "item_idx": candidates,
+            "blend_score": blend_scores,
+            "blend_sources": sources,
+            "has_tt": has_tt,
+            "has_seq": has_seq,
+            "has_v2": has_v2,
+            "short_term_boost": sess_lit["short_term_boost"],
+            "sess_hot": sess_lit["sess_hot"],
+            "sess_warm": sess_lit["sess_warm"],
+            "sess_cold": sess_lit["sess_cold"],
+        })
 
-            reason = self._why_this(row, last_title)
+        feats = self._attach_user_item_features(base)
+        scores = self._score_with_ranker(feats)
 
-            items.append(
-                {
-                    "item_idx": item_idx,
-                    "movieId": int(movie_id) if movie_id is not None else None,
-                    "title": title,
-                    "poster_url": self._resolve_poster_url(item_idx),
-                    "score": float(final_sc),
-                    "reason": reason,
-                    "has_tt": int(row.get("has_tt", 0) or 0),
-                    "has_seq": int(row.get("has_seq", 0) or 0),
-                    "has_v2": int(row.get("has_v2", 0) or 0),
-                    "short_term_boost": float(row.get("short_term_boost", 0.0) or 0.0),
-                    "sess_hot": int(row.get("sess_hot", 0) or 0),
-                    "sess_warm": int(row.get("sess_warm", 0) or 0),
-                    "sess_cold": int(row.get("sess_cold", 0) or 0),
-                }
-            )
+        # Apply feedback adjustments + drop watched
+        scores = self._apply_feedback_adjustments(user_idx, candidates, scores)
+        candidates, scores = self._filter_watched(user_idx, candidates, scores)
 
-        # Sort by score
-        items.sort(key=lambda x: x["score"], reverse=True)
+        if len(candidates) == 0:
+            return {
+                "user_idx": int(user_idx),
+                "k": k,
+                "split": self.config.split,
+                "recommendations": [],
+                "debug": {"reason": "all_filtered_as_watched"} if debug else None,
+            }
 
-        # Interleave by reason for "Netflix-like" grouping feel
-        items = self._interleave_by_reason(items, k)
+        # Rebuild small aligned structures after filtering
+        # For simplicity, recompute sources/flags by item_idx lookup from original base
+        base_map = {it: i for i, it in enumerate(base["item_idx"].to_list())}
+        rows_out: List[Dict[str, Any]] = []
 
-        out: Dict[str, Any] = {
-            "user_idx": user_idx,
+        last_title = sess_lit.get("last_title")
+
+        for it, sc in sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True):
+            i = base_map.get(it)
+            src = sources[i] if i is not None and i < len(sources) else ""
+            tt = has_tt[i] if i is not None and i < len(has_tt) else 0
+            sq = has_seq[i] if i is not None and i < len(has_seq) else 0
+            v2 = has_v2[i] if i is not None and i < len(has_v2) else 0
+
+            meta = self.item_meta_map.get(int(it), {})
+            title = meta.get("title")
+            movie_id = meta.get("movieId")
+
+            poster_url = self.poster_resolver.get(movie_id)
+
+            reason = self._why_this(sq, tt, v2, last_title)
+
+            rows_out.append({
+                "item_idx": int(it),
+                "movieId": int(movie_id) if movie_id is not None else None,
+                "title": title if include_titles else None,
+                "poster_url": poster_url,
+                "score": float(sc),
+                "reason": reason,
+                "has_tt": int(tt),
+                "has_seq": int(sq),
+                "has_v2": int(v2),
+                "short_term_boost": float(sess_lit["short_term_boost"][0]) if sess_lit["short_term_boost"] else 0.0,
+                "sess_hot": int(sess_lit["sess_hot"][0]) if sess_lit["sess_hot"] else 0,
+                "sess_warm": int(sess_lit["sess_warm"][0]) if sess_lit["sess_warm"] else 0,
+                "sess_cold": int(sess_lit["sess_cold"][0]) if sess_lit["sess_cold"] else 1,
+                "blend_source_raw": src,
+            })
+
+        if apply_diversity:
+            rows_out = self._simple_source_diversity(rows_out, k=k, max_streak=3)
+        else:
+            rows_out = rows_out[:k]
+
+        payload = {
+            "user_idx": int(user_idx),
             "k": k,
-            "items": items,
-            "split": self.split,
+            "split": self.config.split,
+            "recommendations": rows_out,
         }
 
         if debug:
-            out["debug"] = {
-                "split": self.split,
+            payload["debug"] = {
+                "split": self.config.split,
                 "project_root": str(self.root),
                 "candidates_path": str(self.candidates_path),
-                "session_features_path": str(self.session_features_path),
+                "session_features_path": str(self.session_path),
                 "ranker_path": str(self.ranker_path),
-                "ranker_meta_path": str(self.ranker_meta_path),
-                "model_auc": float(self._model_auc),
-                "feature_order": list(self._feature_order),
-                "candidate_count": int(len(rows)),
-                "poster_cache_v4_path": str(self.poster_cache.cache_v4_path),
-                "poster_cache_has_any": bool(self.poster_cache.has_any()),
+                "ranker_meta_path": str(self.ranker_meta_path) if self.ranker_meta_path else None,
+                "model_auc": self.model_auc,
+                "feature_order": self.feature_order,
+                "candidate_count": n,
+                "session_bucket": sess_lit.get("session_recency_bucket"),
+                "last_title": last_title,
+                "poster_cache_path": str(self.poster_resolver.cache_path),
             }
 
-        return out
+        return payload
 
 
-# -----------------------------
-# Singleton helper
-# -----------------------------
+# ---------------------------
+# Factory
+# ---------------------------
 
-_SERVICE_SINGLETON: Dict[str, V4RecommenderService] = {}
+_SERVICE_CACHE: Dict[str, V4RecommenderService] = {}
 
 
 def get_v4_service(split: str = "val") -> V4RecommenderService:
-    split = (split or "val").lower().strip()
-    if split not in ("val", "test"):
-        split = "val"
-
-    if split in _SERVICE_SINGLETON:
-        return _SERVICE_SINGLETON[split]
-
-    svc = V4RecommenderService(V4ServiceConfig(split=split))
-    _SERVICE_SINGLETON[split] = svc
-    return svc
+    split = (split or "val").lower()
+    if split not in _SERVICE_CACHE:
+        _SERVICE_CACHE[split] = V4RecommenderService(V4ServiceConfig(split=split))
+    return _SERVICE_CACHE[split]

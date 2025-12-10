@@ -1,71 +1,74 @@
+# scripts/demo_v4_feedback_flow.py
+
 from __future__ import annotations
 
-from typing import Dict, List  # noqa: UP035
-
-import requests
+import json
+import urllib.request
 
 BASE = "http://127.0.0.1:8004"
 
 
-def _get(user_idx: int, k: int = 10, split: str = "val"):
-    r = requests.get(f"{BASE}/recommend", params={
-        "user_idx": user_idx, "k": k, "include_titles": True, "debug": False, "split": split, "apply_feedback": True
-    }, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def _get(url: str):
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
-def _post_feedback(user_idx: int, item_idx: int, event: str, split: str = "val"):
-    r = requests.post(f"{BASE}/feedback", json={
-        "user_idx": user_idx, "item_idx": item_idx, "event": event, "split": split
-    }, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def _post(url: str, payload: dict):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
-def _titles(resp) -> List[str]:
-    return [it.get("title") or str(it.get("item_idx")) for it in resp.get("items", [])]
+def _titles(recs):
+    return [r.get("title") for r in recs if r.get("title")]
 
 
-def main(user_idx: int = 9764, split: str = "val"):
-    print("[DEMO] V4 feedback loop overlay")
-    print("User:", user_idx, "| split:", split)
+def main():
+    user_idx = 9764
+    k = 10
 
-    before = _get(user_idx, k=10, split=split)
-    before_titles = _titles(before)
+    print("[V4 FEEDBACK FLOW DEMO]")
+    print("user_idx:", user_idx)
+
+    url1 = f"{BASE}/recommend?user_idx={user_idx}&k={k}&include_titles=True&debug=False&split=val&apply_diversity=True"
+    before = _get(url1)
+    before_recs = before.get("recommendations", [])
 
     print("\n[BEFORE]")
-    for i, t in enumerate(before_titles, 1):
-        print(f"{i:02d}. {t}")
+    for i, r in enumerate(before_recs[:5], 1):
+        print(f"{i:02d}. {r.get('title')} | {r.get('reason')} | score={r.get('score')}")
 
-    if not before.get("items"):
-        print("No items returned; aborting.")
-        return
+    # Pick two items from the current list to mark as watched + liked
+    if len(before_recs) >= 2:
+        item_a = before_recs[0]["item_idx"]
+        item_b = before_recs[1]["item_idx"]
 
-    # Pick 1st as start, 2nd as like, 3rd as watched
-    items = before["items"]
-    if len(items) >= 1:
-        _post_feedback(user_idx, items[0]["item_idx"], "start", split=split)
-    if len(items) >= 2:
-        _post_feedback(user_idx, items[1]["item_idx"], "like", split=split)
-    if len(items) >= 3:
-        _post_feedback(user_idx, items[2]["item_idx"], "watched", split=split)
+        print("\n[POST FEEDBACK]")
+        print(_post(f"{BASE}/feedback", {"user_idx": user_idx, "item_idx": item_a, "event_type": "watched"}))
+        print(_post(f"{BASE}/feedback", {"user_idx": user_idx, "item_idx": item_b, "event_type": "liked"}))
 
-    after = _get(user_idx, k=10, split=split)
-    after_titles = _titles(after)
+    after = _get(url1)
+    after_recs = after.get("recommendations", [])
 
     print("\n[AFTER]")
-    for i, t in enumerate(after_titles, 1):
-        print(f"{i:02d}. {t}")
+    for i, r in enumerate(after_recs[:5], 1):
+        print(f"{i:02d}. {r.get('title')} | {r.get('reason')} | score={r.get('score')}")
+
+    # Simple diff view
+    bt = _titles(before_recs)
+    at = _titles(after_recs)
 
     print("\n[DIFF]")
-    removed = [t for t in before_titles if t not in after_titles]
-    added = [t for t in after_titles if t not in before_titles]
-    print("Removed:", removed)
-    print("Added:", added)
+    removed = [t for t in bt if t not in at]
+    added = [t for t in at if t not in bt]
 
-    print("\n[OK] If overlay is working, the watched item should drop, "
-          "and started/liked items should be prioritized in sections.")
+    print("Removed from top list:", removed[:10])
+    print("Added to top list:", added[:10])
 
 
 if __name__ == "__main__":
