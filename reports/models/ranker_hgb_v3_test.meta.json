@@ -14,10 +14,10 @@
     "item_conf_decay_sum",
     "item_days_since_last"
   ],
-  "auc": 0.763756144820193,
+  "auc": 0.7647139016592411,
   "train_rows": 8000000,
   "val_rows": 2000000,
-  "train_pos_rate": 0.0013135,
+  "train_pos_rate": 0.001313,
   "config": {
     "candidates_path": "data/processed/v3_candidates_test.parquet",
     "test_conf_path": "data/processed/test_conf.parquet",
