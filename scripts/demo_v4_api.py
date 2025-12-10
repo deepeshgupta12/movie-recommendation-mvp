@@ -1,7 +1,5 @@
 # scripts/demo_v4_api.py
 
-from __future__ import annotations
-
 import json
 import urllib.error
 import urllib.request
@@ -11,7 +9,11 @@ BASE = "http://127.0.0.1:8004"
 
 def _get(url: str):
     with urllib.request.urlopen(url, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+        raw = r.read().decode("utf-8")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
 
 
 def main():
@@ -23,7 +25,8 @@ def main():
     try:
         print(json.dumps(_get(health_url), indent=2))
     except Exception as e:
-        print("[HEALTH FAILED]", repr(e))
+        print("\n[HEALTH FAILED]")
+        print(repr(e))
         return
 
     rec_url = (
@@ -34,28 +37,32 @@ def main():
 
     try:
         out = _get(rec_url)
-        recs = out.get("recommendations", [])
-        print("\nTop-5:")
-        for i, r in enumerate(recs[:5], 1):
-            print(f"{i:02d}. {r.get('title')} | score={r.get('score')} | reason={r.get('reason')}")
-
-        if out.get("debug"):
-            print("\n[DEBUG]")
-            for k, v in out["debug"].items():
-                print("-", k + ":", v)
-
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
+        body = e.read().decode("utf-8")
         print("\n[HTTP ERROR]")
-        print(json.dumps({
-            "http_error": True,
-            "status": e.code,
-            "body": body,
-            "url": rec_url
-        }, indent=2))
+        print(json.dumps({"status": e.code, "body": body, "url": rec_url}, indent=2))
+        return
     except Exception as e:
-        print("\n[UNEXPECTED ERROR]")
+        print("\n[ERROR]")
         print(repr(e))
+        return
+
+    recs = out.get("recommendations", [])
+    print("\nTop-5:")
+    for i, it in enumerate(recs[:5], 1):
+        title = it.get("title")
+        score = it.get("score")
+        reason = it.get("reason")
+        bucket = it.get("bucket")
+        print(f"{i:02d}. {title} | score={score} | {bucket} | reason={reason}")
+
+    if out.get("debug"):
+        print("\n[DEBUG]")
+        for k, v in out["debug"].items():
+            if k == "feature_order":
+                print(f"- {k}: {v}")
+            else:
+                print(f"- {k}: {v}")
 
 
 if __name__ == "__main__":

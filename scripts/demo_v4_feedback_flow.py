@@ -1,8 +1,7 @@
 # scripts/demo_v4_feedback_flow.py
 
-from __future__ import annotations
-
 import json
+import urllib.error
 import urllib.request
 
 BASE = "http://127.0.0.1:8004"
@@ -14,9 +13,10 @@ def _get(url: str):
 
 
 def _post(url: str, payload: dict):
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode("utf-8"),
+        data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -24,51 +24,56 @@ def _post(url: str, payload: dict):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _titles(recs):
-    return [r.get("title") for r in recs if r.get("title")]
+def _top_titles(out, n=10):
+    recs = out.get("recommendations", [])
+    return [r.get("title") for r in recs[:n]]
 
 
 def main():
-    user_idx = 9764
-    k = 10
-
     print("[V4 FEEDBACK FLOW DEMO]")
+    user_idx = 9764
     print("user_idx:", user_idx)
 
-    url1 = f"{BASE}/recommend?user_idx={user_idx}&k={k}&include_titles=True&debug=False&split=val&apply_diversity=True"
+    url1 = f"{BASE}/recommend?user_idx={user_idx}&k=20&include_titles=True&debug=False&split=val&apply_diversity=True"
     before = _get(url1)
-    before_recs = before.get("recommendations", [])
 
-    print("\n[BEFORE]")
-    for i, r in enumerate(before_recs[:5], 1):
-        print(f"{i:02d}. {r.get('title')} | {r.get('reason')} | score={r.get('score')}")
+    before_top = _top_titles(before, 10)
+    print("\n[BEFORE TOP-10]")
+    for i, t in enumerate(before_top, 1):
+        print(f"{i:02d}. {t}")
 
-    # Pick two items from the current list to mark as watched + liked
-    if len(before_recs) >= 2:
-        item_a = before_recs[0]["item_idx"]
-        item_b = before_recs[1]["item_idx"]
+    # Pick a couple of items from the current list and mark watched/like
+    recs = before.get("recommendations", [])
+    if len(recs) >= 2:
+        item_a = recs[0]["item_idx"]
+        item_b = recs[1]["item_idx"]
+    else:
+        print("Not enough recs to test feedback.")
+        return
 
-        print("\n[POST FEEDBACK]")
-        print(_post(f"{BASE}/feedback", {"user_idx": user_idx, "item_idx": item_a, "event_type": "watched"}))
-        print(_post(f"{BASE}/feedback", {"user_idx": user_idx, "item_idx": item_b, "event_type": "liked"}))
+    fb_url = f"{BASE}/feedback"
+
+    print("\n[POST FEEDBACK]")
+    print("like:", item_a)
+    print(_post(fb_url, {"user_idx": user_idx, "item_idx": item_a, "event": "like"}))
+
+    print("watched:", item_b)
+    print(_post(fb_url, {"user_idx": user_idx, "item_idx": item_b, "event": "watched"}))
 
     after = _get(url1)
-    after_recs = after.get("recommendations", [])
 
-    print("\n[AFTER]")
-    for i, r in enumerate(after_recs[:5], 1):
-        print(f"{i:02d}. {r.get('title')} | {r.get('reason')} | score={r.get('score')}")
+    after_top = _top_titles(after, 10)
+    print("\n[AFTER TOP-10]")
+    for i, t in enumerate(after_top, 1):
+        print(f"{i:02d}. {t}")
 
-    # Simple diff view
-    bt = _titles(before_recs)
-    at = _titles(after_recs)
+    # Simple diff
+    removed = [t for t in before_top if t not in after_top]
+    added = [t for t in after_top if t not in before_top]
 
     print("\n[DIFF]")
-    removed = [t for t in bt if t not in at]
-    added = [t for t in at if t not in bt]
-
-    print("Removed from top list:", removed[:10])
-    print("Added to top list:", added[:10])
+    print("removed_from_top10:", removed)
+    print("added_to_top10:", added)
 
 
 if __name__ == "__main__":
