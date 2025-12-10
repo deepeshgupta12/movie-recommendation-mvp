@@ -1,12 +1,11 @@
 """
 V4 API (Session-aware ranker)
 
-Robust FastAPI layer for V4 recommendations.
+FastAPI layer for V4 recommendations.
 
-Key guarantees:
-- Split-aware, cached service instances.
-- Does NOT rely on get_v4_service exported from reco_service_v4.
-- Normalizes service outputs so API always returns:
+Guarantees:
+- Split-aware cached service instances.
+- API response contract is stable and ALWAYS returns:
     {
       user_idx,
       split,
@@ -15,9 +14,9 @@ Key guarantees:
       debug: {... optional ...}
     }
 
-Backward compatibility:
+Compatibility:
 - If service returns "items", API maps it to "recommendations".
-- If service returns list, wraps it into "recommendations".
+- If service returns a list, wraps it into "recommendations".
 """
 
 from __future__ import annotations
@@ -32,8 +31,8 @@ from src.service.reco_service_v4 import V4RecommenderService, V4ServiceConfig
 
 app = FastAPI(
     title="Movie Recommendation API - V4",
-    version="4.0.1",
-    description="Session-aware hybrid recommender (Two-Tower ANN + GRU + V2 prior + Session features).",
+    version="4.0.2",
+    description="Session-aware hybrid recommender (ANN + GRU + V2 prior + Session features).",
 )
 
 _SERVICE_CACHE: Dict[str, V4RecommenderService] = {}
@@ -54,22 +53,17 @@ def _get_service(split: str) -> V4RecommenderService:
 
 
 class RecommendResponse(BaseModel):
-    user_idx: int
+    user_idx: int = Field(..., ge=0)
     split: str
-    k: int
+    k: int = Field(..., ge=1, le=200)
 
-    # Accept both keys from upstream via alias, but we will also normalize in code.
-    recommendations: List[Any] = Field(default_factory=list, alias="items")
+    # We intentionally DO NOT use alias here.
+    # Normalization happens in code, so the response model is strict & stable.
+    recommendations: List[Any] = Field(default_factory=list)
 
     debug: Optional[dict] = None
 
-    # Pydantic v2 config
-    model_config = {"populate_by_name": True, "extra": "allow"}
-
-    # Pydantic v1 fallback
-    class Config:
-        allow_population_by_field_name = True
-        extra = "allow"
+    model_config = {"extra": "allow"}
 
 
 def _normalize_out(
@@ -105,11 +99,10 @@ def _normalize_out(
             "debug": {"warning": f"Unexpected service output type: {type(raw)}"},
         }
 
-    # Prefer explicit recommendations
-    if "recommendations" in raw and isinstance(raw["recommendations"], list):
+    # Determine recommendations payload
+    if isinstance(raw.get("recommendations"), list):
         recs = raw["recommendations"]
-    # Fallback to items
-    elif "items" in raw and isinstance(raw["items"], list):
+    elif isinstance(raw.get("items"), list):
         recs = raw["items"]
     else:
         recs = []
@@ -122,9 +115,9 @@ def _normalize_out(
         "debug": raw.get("debug"),
     }
 
-    # Preserve extra keys (non-breaking)
+    # Preserve extra keys if any (non-breaking)
     for key, val in raw.items():
-        if key not in out and key not in {"items"}:
+        if key not in out and key != "items":
             out[key] = val
 
     return out
@@ -151,6 +144,7 @@ def config(split: str = Query("val")):
     try:
         return asdict(cfg)
     except Exception:
+        # dataclass might not be used; safe fallback
         return {"split": getattr(cfg, "split", split)}
 
 
