@@ -1,204 +1,353 @@
 from __future__ import annotations
 
-import contextlib
+import json
 from pathlib import Path
-from typing import Dict, List, Tuple  # noqa: UP035
+from typing import Dict, List, Optional, Tuple  # noqa: UP035
 
 import numpy as np
 import polars as pl
 from tqdm import tqdm
 
-from src.config.settings import settings
-
-PROCESSED = Path(settings.PROCESSED_DIR)
-REPORTS = Path(getattr(settings, "REPORTS_DIR", "reports"))
-MODELS_DIR = REPORTS / "models"
-
-
-def _p(name: str) -> Path:
-    return PROCESSED / name
-
-
-def _load_parquet(name: str) -> pl.DataFrame:
-    path = _p(name)
-    if not path.exists():
-        raise FileNotFoundError(f"Missing file: {path}")
-    return pl.read_parquet(path)
-
-
-def _load_hnsw_index():
-    # Uses hnswlib; assumed already in deps for your ANN steps
+try:
     import hnswlib
-
-    idx_path = MODELS_DIR / "ann_hnsw_items_v3.bin"
-    meta_path = MODELS_DIR / "ann_hnsw_items_v3.meta.json"
-
-    if not idx_path.exists():
-        raise FileNotFoundError(f"Missing ANN index: {idx_path}")
-    if not meta_path.exists():
-        raise FileNotFoundError(f"Missing ANN meta: {meta_path}")
-
-    import json
-    meta = json.loads(meta_path.read_text())
-
-    dim = int(meta.get("dim", 64))
-    space = meta.get("space", "ip")  # your builder likely used "ip"
-
-    index = hnswlib.Index(space=space, dim=dim)
-    index.load_index(str(idx_path))
-
-    # Optional tuning
-    ef = int(meta.get("ef_search", 100))
-    with contextlib.suppress(Exception):
-        index.set_ef(ef)
-
-    return index, meta
+except Exception as e:
+    raise RuntimeError(
+        "hnswlib is required for ANN retrieval. "
+        "Install it via your pyproject dependencies."
+    ) from e
 
 
-def _to_vec_list(df: pl.DataFrame, id_col: str) -> Dict[int, np.ndarray]:
-    out: Dict[int, np.ndarray] = {}
-    for row in df.select([id_col, "embedding"]).iter_rows(named=True):
-        idx = int(row[id_col])
-        emb = np.asarray(row["embedding"], dtype=np.float32)
-        out[idx] = emb
-    return out
+# -----------------------------
+# Paths
+# -----------------------------
+DATA_DIR = Path("data")
+PROCESSED_DIR = DATA_DIR / "processed"
+REPORTS_DIR = Path("reports")
+MODELS_DIR = REPORTS_DIR / "models"
+
+USER_EMB_TEST_PATH = PROCESSED_DIR / "user_emb_v3_test.parquet"
+ITEM_EMB_PATH = PROCESSED_DIR / "item_emb_v3.parquet"
+
+TRAIN_CONF_PATH = PROCESSED_DIR / "train_conf.parquet"
+TEST_CONF_PATH = PROCESSED_DIR / "test_conf.parquet"
+
+ANN_INDEX_PATH = MODELS_DIR / "ann_hnsw_items_v3.bin"
+ANN_META_PATH = MODELS_DIR / "ann_hnsw_items_v3.meta.json"
+
+OUT_PATH = PROCESSED_DIR / "ann_candidates_v3_test.parquet"
 
 
-def _build_seen_map(train_conf: pl.DataFrame, users: List[int]) -> Dict[int, set]:
-    # Build a compact user->seen set for only capped users
-    user_set = set(users)
+# -----------------------------
+# Config
+# -----------------------------
+DEFAULT_TOPK = 200
+DEFAULT_ANN_K = 200
+FILTER_SEEN = True
 
-    filt = train_conf.filter(pl.col("user_idx").is_in(list(user_set))).select(
-        ["user_idx", "item_idx"]
+
+# -----------------------------
+# Helpers: Loaders
+# -----------------------------
+def _load_item_embeddings() -> Tuple[np.ndarray, np.ndarray]:
+    if not ITEM_EMB_PATH.exists():
+        raise FileNotFoundError(f"Missing item embeddings: {ITEM_EMB_PATH}")
+
+    df = pl.read_parquet(ITEM_EMB_PATH).select(["item_idx", "embedding"])
+
+    item_idx = df["item_idx"].to_numpy()
+    emb_list = df["embedding"].to_list()
+
+    mat = np.asarray(emb_list, dtype=np.float32)
+    if mat.ndim != 2:
+        raise RuntimeError("Item embedding matrix is not 2D.")
+
+    return item_idx.astype(np.int64), mat
+
+
+def _load_user_embeddings_test() -> Tuple[np.ndarray, np.ndarray]:
+    if not USER_EMB_TEST_PATH.exists():
+        raise FileNotFoundError(f"Missing test user embeddings: {USER_EMB_TEST_PATH}")
+
+    df = (
+        pl.read_parquet(USER_EMB_TEST_PATH)
+        .select(["user_idx", "embedding"])
+        .sort("user_idx")
     )
 
-    grouped = filt.group_by("user_idx").agg(
-        pl.col("item_idx").unique().alias("seen")
-    )
+    user_idx = df["user_idx"].to_numpy()
+    emb_list = df["embedding"].to_list()
+
+    mat = np.asarray(emb_list, dtype=np.float32)
+    if mat.ndim != 2:
+        raise RuntimeError("User embedding matrix is not 2D.")
+
+    return user_idx.astype(np.int64), mat
+
+
+def _load_test_users_from_conf(cap_users: int = 50000) -> np.ndarray:
+    if not TEST_CONF_PATH.exists():
+        raise FileNotFoundError(f"Missing: {TEST_CONF_PATH}")
+
+    df = pl.read_parquet(TEST_CONF_PATH).select("user_idx").unique().sort("user_idx")
+    users = df["user_idx"].to_list()
+
+    if len(users) > cap_users:
+        users = users[:cap_users]
+
+    return np.asarray(users, dtype=np.int64)
+
+
+def _build_seen_map() -> Dict[int, set]:
+    if not FILTER_SEEN:
+        return {}
+
+    if not TRAIN_CONF_PATH.exists():
+        print("[WARN] train_conf.parquet missing; cannot filter seen.")
+        return {}
+
+    print("[START] Building seen map from train_conf...")
+    train = pl.read_parquet(TRAIN_CONF_PATH).select(["user_idx", "item_idx"])
+
+    grouped = train.group_by("user_idx").agg(pl.col("item_idx").alias("seen"))
 
     seen_map: Dict[int, set] = {}
-    for row in grouped.iter_rows(named=True):
-        u = int(row["user_idx"])
-        seen_map[u] = set(int(x) for x in (row["seen"] or []))
+    for u, items in zip(grouped["user_idx"].to_list(), grouped["seen"].to_list()):
+        seen_map[int(u)] = set(int(x) for x in items)
+
+    print(f"[OK] seen map users: {len(seen_map)}")
     return seen_map
 
 
-def main(
-    topk: int = 200,
-    ann_k: int = 200,
-    user_cap: int = 50000,
-    filter_seen: bool = True,
-):
-    print("\n[START] Exporting ANN candidates for test (V3)...")
+def _load_ann_index(dim: int) -> "hnswlib.Index":
+    if not ANN_INDEX_PATH.exists():
+        raise FileNotFoundError(f"Missing ANN index: {ANN_INDEX_PATH}")
 
-    # --- Load test users ---
-    test_conf = _load_parquet("test_conf.parquet").select(["user_idx", "item_idx"])
-    users = (
-        test_conf.select("user_idx")
-        .unique()
-        .sort("user_idx")
-        .head(user_cap)
-        .get_column("user_idx")
-        .to_list()
+    idx = hnswlib.Index(space="ip", dim=dim)
+    idx.load_index(str(ANN_INDEX_PATH))
+    return idx
+
+
+# -----------------------------
+# Helpers: Label mode handling
+# -----------------------------
+def _read_ann_label_mode_from_meta() -> Optional[str]:
+    if not ANN_META_PATH.exists():
+        return None
+    try:
+        meta = json.loads(ANN_META_PATH.read_text())
+        mode = meta.get("id_mode") or meta.get("label_mode") or meta.get("ann_id_mode")
+        if mode in {"row", "item_idx"}:
+            return mode
+    except Exception:
+        return None
+    return None
+
+
+def _infer_label_mode(
+    index: "hnswlib.Index",
+    sample_user_vec: np.ndarray,
+    item_idx: np.ndarray,
+    idx_to_row: Dict[int, int],
+    ann_k: int
+) -> str:
+    labels, _ = index.knn_query(sample_user_vec, k=min(ann_k, 200))
+    labels = labels[0].astype(np.int64)
+
+    # Heuristic 1: if all labels are small and fit row space
+    if labels.max(initial=0) < len(item_idx):
+        return "row"
+
+    # Heuristic 2: if labels look like item_idx values
+    # We check a small sample membership
+    sample = labels[: min(len(labels), 20)]
+    ok = all(int(x) in idx_to_row for x in sample.tolist())
+    if ok:
+        return "item_idx"
+
+    raise RuntimeError(
+        "Could not infer ANN label mode. "
+        "Your ANN index likely doesn't match current item_emb_v3. "
+        "Rebuild ann_hnsw_items_v3.bin from item_emb_v3.parquet."
     )
-    users = [int(u) for u in users]
 
-    print(f"[OK] test users after cap: {len(users)}")
 
-    # --- Load embeddings ---
-    print("[START] Loading user/item embeddings (V3)...")
-    user_emb = _load_parquet("user_emb_v3.parquet")
-    item_emb = _load_parquet("item_emb_v3.parquet")
+def _resolve_labels(
+    labels: np.ndarray,
+    item_idx: np.ndarray,
+    idx_to_row: Dict[int, int],
+    mode: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      cand_items: global item_idx values
+      local_ids: row indices into item_mat for scoring
+    """
+    labels = labels.astype(np.int64)
 
-    user_vecs = _to_vec_list(user_emb, "user_idx")
-    item_vecs = _to_vec_list(item_emb, "item_idx")
+    if mode == "row":
+        # labels are row ids
+        local_ids = labels
+        cand_items = item_idx[local_ids]
+        return cand_items, local_ids
 
-    # Intersect cap with available exported embeddings
-    users = [u for u in users if u in user_vecs]
-    print(f"[OK] users with available embeddings: {len(users)}")
-    print(f"[OK] item embedding pool: {len(item_vecs)}")
+    if mode == "item_idx":
+        # labels are global item_idx values
+        cand_items = labels
+        local_ids = np.asarray([idx_to_row[int(i)] for i in cand_items.tolist()], dtype=np.int64)
+        return cand_items, local_ids
 
-    # --- Load ANN index ---
-    index, meta = _load_hnsw_index()
-    dim = int(meta.get("dim", 64))
+    raise ValueError(f"Unknown label mode: {mode}")
+
+
+# -----------------------------
+# Helpers: Scoring
+# -----------------------------
+def _dot_scores(user_vec: np.ndarray, item_mat: np.ndarray, local_ids: np.ndarray) -> np.ndarray:
+    cand_vecs = item_mat[local_ids]
+    return cand_vecs @ user_vec
+
+
+def _build_user_emb_lookup(emb_users: np.ndarray, emb_mat: np.ndarray) -> Dict[int, np.ndarray]:
+    return {int(u): emb_mat[i] for i, u in enumerate(emb_users.tolist())}
+
+
+def _validate_alignment(test_users: np.ndarray, emb_users: np.ndarray) -> np.ndarray:
+    set_emb = set(int(u) for u in emb_users.tolist())
+    missing = [int(u) for u in test_users.tolist() if int(u) not in set_emb]
+
+    if missing:
+        raise RuntimeError(
+            f"Missing embeddings for {len(missing)} test users. "
+            f"Example missing user_idx: {missing[:10]}. "
+            "Your export_user_embeddings_test_v3 must cover the same 50k user cap."
+        )
+    return test_users
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main(topk: int = DEFAULT_TOPK, ann_k: int = DEFAULT_ANN_K):
+    print("\n[START] Exporting ANN candidates for test (V3) - full 50k coverage...")
+
+    if topk > 200:
+        raise ValueError("topk should be <= 200 for this local V3 pipeline.")
+    if ann_k < topk:
+        ann_k = topk
+
+    # Canonical test users
+    test_users = _load_test_users_from_conf(cap_users=50000)
+    print(f"[OK] test users after cap: {len(test_users)}")
+
+    # Load embeddings
+    print("[START] Loading user embeddings (TEST) ...")
+    emb_users, user_mat = _load_user_embeddings_test()
+    print(f"[OK] users with embeddings file: {len(emb_users)}")
+
+    print("[START] Loading item embeddings (V3) ...")
+    item_idx, item_mat = _load_item_embeddings()
+    print(f"[OK] item embedding pool: {len(item_idx)}")
+
+    # Alignment check
+    test_users = _validate_alignment(test_users, emb_users)
+
+    # Lookups
+    user_lookup = _build_user_emb_lookup(emb_users, user_mat)
+    idx_to_row = {int(ix): i for i, ix in enumerate(item_idx.tolist())}
+
+    # Load ANN index
+    dim = int(item_mat.shape[1])
+    idx = _load_ann_index(dim=dim)
     print(f"[OK] ANN index loaded | dim={dim}")
 
-    # --- Optional seen filter ---
-    seen_map: Dict[int, set] = {}
-    if filter_seen:
-        print("[START] Building seen map from train_conf...")
-        train_conf = _load_parquet("train_conf.parquet").select(["user_idx", "item_idx"])
-        seen_map = _build_seen_map(train_conf, users)
-        print(f"[OK] seen map users: {len(seen_map)}")
+    # Seen map
+    seen_map = _build_seen_map() if FILTER_SEEN else {}
 
-    # --- Batch ANN retrieval ---
+    # Detect label mode
+    mode = _read_ann_label_mode_from_meta()
+    if mode is None:
+        # Infer using first test user
+        probe_user = int(test_users[0])
+        mode = _infer_label_mode(idx, user_lookup[probe_user], item_idx, idx_to_row, ann_k)
+    print(f"[OK] ANN label mode: {mode}")
+
+    out_users: List[int] = []
+    out_cands: List[List[int]] = []
+    out_scores: List[List[float]] = []
+
     print(
-        f"[START] ANN retrieval + dot-product rescoring (ann_k={ann_k}, out_k={topk}, filter_seen={filter_seen})..."
+        f"[START] ANN retrieval + dot-product rescoring "
+        f"(ann_k={ann_k}, out_k={topk}, filter_seen={FILTER_SEEN})..."
     )
 
-    results_user: List[int] = []
-    results_cands: List[List[int]] = []
-    results_scores: List[List[float]] = []
+    for u in tqdm(test_users.tolist(), desc="ANN users (test)"):
+        u = int(u)
+        uvec = user_lookup[u]
 
-    # Build a fast item lookup for rescoring
-    # We will only rescore items that exist in item_vecs
-    def rescore(uvec: np.ndarray, cand_ids: List[int]) -> List[float]:
-        # Safe dot product
-        vecs = []
-        valid_ids = []
-        for cid in cand_ids:
-            v = item_vecs.get(cid)
-            if v is not None:
-                vecs.append(v)
-                valid_ids.append(cid)
-        if not vecs:
-            return [], []
-        mat = np.vstack(vecs)  # (n, d)
-        s = mat @ uvec  # (n,)
-        return valid_ids, s.astype(np.float32).tolist()
+        labels, _ = idx.knn_query(uvec, k=ann_k)
+        labels = labels[0].astype(np.int64)
 
-    # Small batch to reduce python overhead
-    batch_size = 512
-    for i in tqdm(range(0, len(users), batch_size), desc="ANN users (test)"):
-        batch_users = users[i : i + batch_size]
-        batch_vecs = np.vstack([user_vecs[u] for u in batch_users]).astype(np.float32)
+        # Map labels -> (global item_idx, local row ids for scoring)
+        cand_items, local_ids = _resolve_labels(labels, item_idx, idx_to_row, mode)
 
-        # hnswlib returns labels + distances
-        labels, _ = index.knn_query(batch_vecs, k=ann_k)
+        # Optionally filter seen using global item_idx
+        if FILTER_SEEN and u in seen_map:
+            s = seen_map[u]
+            mask = np.array([int(ci) not in s for ci in cand_items.tolist()], dtype=bool)
+            cand_items = cand_items[mask]
+            local_ids = local_ids[mask]
 
-        for u, cand_arr, uvec in zip(batch_users, labels, batch_vecs):
-            cand_ids = [int(x) for x in cand_arr.tolist()]
+        if len(local_ids) == 0:
+            # Defensive fallback: no filter for this user
+            labels, _ = idx.knn_query(uvec, k=topk)
+            labels = labels[0].astype(np.int64)
+            cand_items, local_ids = _resolve_labels(labels, item_idx, idx_to_row, mode)
 
-            if filter_seen:
-                seen = seen_map.get(u, set())
-                if seen:
-                    cand_ids = [c for c in cand_ids if c not in seen]
+        # Rescore by dot product
+        scores = _dot_scores(uvec, item_mat, local_ids)
 
-            cand_ids, cand_scores = rescore(uvec, cand_ids)
+        # Sort by score desc
+        order = np.argsort(-scores)
+        cand_items = cand_items[order]
+        scores = scores[order]
 
-            # Truncate
-            cand_ids = cand_ids[:topk]
-            cand_scores = cand_scores[:topk]
+        # Truncate
+        cand_items = cand_items[:topk]
+        scores = scores[:topk]
 
-            results_user.append(int(u))
-            results_cands.append(cand_ids)
-            results_scores.append([float(x) for x in cand_scores])
+        out_users.append(u)
+        out_cands.append([int(x) for x in cand_items.tolist()])
+        out_scores.append([float(x) for x in scores.tolist()])
 
-    out = pl.DataFrame(
-        {
-            "user_idx": results_user,
-            "candidates": results_cands,
-            "tt_scores": results_scores,
-        }
+    df = pl.DataFrame(
+        {"user_idx": out_users, "candidates": out_cands, "tt_scores": out_scores},
+        orient="col",
     )
 
-    out_path = _p("ann_candidates_v3_test.parquet")
-    out.write_parquet(out_path)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(OUT_PATH)
+
+    # Write meta for reproducibility
+    meta = {
+        "version": "v3_test",
+        "topk": topk,
+        "ann_k": ann_k,
+        "filter_seen": FILTER_SEEN,
+        "users_cap": 50000,
+        "users_exported": len(out_users),
+        "item_pool": int(len(item_idx)),
+        "embedding_dim": int(dim),
+        "ann_index_path": str(ANN_INDEX_PATH),
+        "user_emb_path": str(USER_EMB_TEST_PATH),
+        "item_emb_path": str(ITEM_EMB_PATH),
+        "id_mode": mode,
+    }
+    (OUT_PATH.parent / "ann_candidates_v3_test.meta.json").write_text(json.dumps(meta, indent=2))
 
     print("[DONE] ANN candidates exported.")
-    print(f"[PATH] {out_path.resolve()}")
-    print(f"[OK] users exported: {out.height}")
-    print(f"[OK] topk={topk} | ann_k={ann_k} | filter_seen={filter_seen}")
+    print(f"[PATH] {OUT_PATH.resolve()}")
+    print(f"[OK] users exported: {len(out_users)}")
+    print(f"[OK] topk={topk} | ann_k={ann_k} | filter_seen={FILTER_SEEN} | id_mode={mode}")
 
 
 if __name__ == "__main__":
