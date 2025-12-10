@@ -14,10 +14,9 @@ def main():
     print("k:", out["k"])
 
     for i, it in enumerate(out["items"], start=1):
+        title = it.get("title") or f"item_idx={it['item_idx']}"
         print(
-            f"{i:02d}. {it.get('title') or it['item_idx']} "
-            f"| score={it['score']:.4f} "
-            f"| reason={it.get('reason')}"
+            f"{i:02d}. {title} | score={it['score']:.4f} | reason={it.get('reason')}"
         )
 
     dbg = out.get("debug") or {}
