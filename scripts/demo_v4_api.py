@@ -1,44 +1,105 @@
+from __future__ import annotations
+
 import json
+import os
+import sys
+import urllib.parse
 import urllib.request
+from typing import Any, Dict, Optional  # noqa: UP035
+
+DEFAULT_API_BASE = os.environ.get("V4_API_BASE", "http://127.0.0.1:8004")
 
 
-def _get(url: str):
-    with urllib.request.urlopen(url) as r:
-        return json.loads(r.read().decode("utf-8"))
+def _get(url: str, timeout: int = 30) -> Dict[str, Any]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            raw = r.read().decode("utf-8")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8")
+        except Exception:
+            body = ""
+        raise RuntimeError(
+            f"HTTPError {e.code} for URL:\n{url}\n\nResponse body:\n{body}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"URLError while calling:\n{url}\n\nIs the API running at {DEFAULT_API_BASE}?"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"Unexpected error while calling:\n{url}\n\n{type(e).__name__}: {e}"
+        ) from e
 
 
-def main():
-    base = "http://127.0.0.1:8004"
+def build_url(path: str, params: Optional[Dict[str, Any]] = None) -> str:
+    base = DEFAULT_API_BASE.rstrip("/")
+    full = f"{base}{path}"
+    if not params:
+        return full
+    qs = urllib.parse.urlencode(params)
+    return f"{full}?{qs}"
 
+
+def main() -> None:
     print("[V4 API DEMO]")
-    print(_get(f"{base}/health"))
+    print(f"[BASE] {DEFAULT_API_BASE}")
 
-    user_idx = 9764
-    out = _get(
-        f"{base}/recommend?user_idx={user_idx}&k=20&include_titles=true&debug=true&split=val"
+    # 1) Health check
+    health_url = build_url("/health")
+    print(f"[CALL] {health_url}")
+    health = _get(health_url)
+    print(health)
+
+    # 2) Recommend call (val default)
+    user_idx = int(os.environ.get("USER_IDX", "9764"))
+    k = int(os.environ.get("K", "20"))
+    split = os.environ.get("SPLIT", "val")
+    debug = os.environ.get("DEBUG", "0") == "1"
+
+    rec_url = build_url(
+        "/recommend",
+        {
+            "user_idx": user_idx,
+            "k": k,
+            "include_titles": True,
+            "debug": debug,
+            "split": split,
+        },
     )
+    print(f"[CALL] {rec_url}")
 
-    recs = out.get("recommendations") or out.get("items") or []
+    out = _get(rec_url)
+
+    # The API response model expects "recommendations"
+    recs = out.get("recommendations", [])
+    if not isinstance(recs, list):
+        raise RuntimeError(
+            f"Unexpected recommend payload shape.\nKeys: {list(out.keys())}"
+        )
 
     print("\nTop-5:")
-    for i, rec in enumerate(recs[:5], 1):
-        title = rec.get("title", rec.get("item_idx"))
-        score = rec.get("score")
-        reason = rec.get("reason")
+    for i, r in enumerate(recs[:5], start=1):
+        title = r.get("title") or f"item_idx={r.get('item_idx')}"
+        score = r.get("score", 0.0)
+        reason = r.get("reason", "")
         print(f"{i:02d}. {title} | score={score} | reason={reason}")
 
-    dbg = out.get("debug") or {}
-    print("\n[DEBUG]")
-    for k in [
-        "split",
-        "candidates_path",
-        "session_features_path",
-        "ranker_path",
-        "model_auc",
-    ]:
-        if k in dbg:
-            print(f"- {k}: {dbg[k]}")
+    if debug:
+        print("\n[DEBUG]")
+        dbg = out.get("debug", {})
+        if isinstance(dbg, dict):
+            for k, v in dbg.items():
+                print(f"- {k}: {v}")
+
+    print("\n[DONE] V4 API demo complete.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("\n[ERROR]")
+        print(str(e))
+        sys.exit(1)
