@@ -21,3 +21,8 @@ data/synthetic/
 
 # VS Code
 .vscode/
+# Model artifacts
+reports/models/*.pkl
+reports/models/*.bin
+reports/models/*.pt
+reports/models/*.meta.json
