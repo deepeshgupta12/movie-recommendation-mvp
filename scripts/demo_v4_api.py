@@ -1,112 +1,70 @@
+# scripts/demo_v4_api.py
 from __future__ import annotations
 
-import http.client
 import json
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8004"
 
-
-def _pretty(obj):
+def _get(url: str, timeout: int = 30):
     try:
-        return json.dumps(obj, indent=2, ensure_ascii=False)
-    except Exception:
-        return str(obj)
-
-
-def _get(url: str):
-    try:
-        with urllib.request.urlopen(url, timeout=60) as r:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
             raw = r.read().decode("utf-8")
-            try:
-                return json.loads(raw)
-            except Exception:
-                return {"raw": raw}
-
+            return json.loads(raw)
     except urllib.error.HTTPError as e:
-        body = ""
         try:
             body = e.read().decode("utf-8")
+            return {"http_error": True, "status": e.code, "body": body, "url": url}
         except Exception:
-            pass
-        return {
-            "http_error": e.code,
-            "reason": str(e.reason),
-            "body": body,
-            "url": url,
-        }
-
-    except http.client.RemoteDisconnected as e:
-        return {
-            "remote_disconnected": True,
-            "detail": str(e),
-            "url": url,
-        }
-
-    except urllib.error.URLError as e:
-        return {
-            "url_error": True,
-            "detail": str(e.reason),
-            "url": url,
-        }
-
+            return {"http_error": True, "status": e.code, "url": url}
     except Exception as e:
-        return {
-            "unexpected_client_error": type(e).__name__,
-            "detail": str(e),
-            "url": url,
-        }
+        return {"remote_disconnected": True, "detail": str(e), "url": url}
 
 
 def main():
+    base = "http://127.0.0.1:8004"
     print("[V4 API DEMO]")
-    print("[BASE]", BASE)
+    print("[BASE]", base)
 
-    health_url = f"{BASE}/health"
+    health_url = f"{base}/health"
     print("[CALL]", health_url)
-    health = _get(health_url)
-    print(_pretty(health))
+    print(json.dumps(_get(health_url), indent=2))
 
     rec_url = (
-        f"{BASE}/recommend"
-        f"?user_idx=9764"
-        f"&k=20"
-        f"&include_titles=True"
-        f"&debug=True"
-        f"&split=val"
+        f"{base}/recommend?"
+        "user_idx=9764&k=20&include_titles=True&debug=True&split=val"
     )
     print("[CALL]", rec_url)
-
     out = _get(rec_url)
 
     if out.get("remote_disconnected"):
         print("\n[SERVER DROPPED CONNECTION]")
-        print(_pretty(out))
+        print(json.dumps(out, indent=2))
         print(
             "\nLikely causes:\n"
             "1) uvicorn reload subprocess crash\n"
             "2) fatal error during V4 service recommend()\n"
-            "3) native lib abort (rare, but possible with heavy Polars ops)\n\n"
-            "Next check: run API WITHOUT --reload and watch logs."
+            "3) native lib abort (rare)\n\n"
+            "Next check: run API WITHOUT --reload and watch logs:\n"
+            "  python -m uvicorn src.service.api_v4:app --port 8004\n"
         )
         return
 
-    if "http_error" in out or out.get("url_error") or out.get("unexpected_client_error"):
-        print("\n[ERROR PAYLOAD]")
-        print(_pretty(out))
+    if out.get("http_error"):
+        print("\n[HTTP ERROR]")
+        print(json.dumps(out, indent=2))
         return
 
-    recs = out.get("recommendations") or out.get("items") or []
+    items = out.get("items", [])
     print("\nTop-5:")
-    for i, r in enumerate(recs[:5], 1):
-        print(f"{i:02d}. {r.get('title')} | score={r.get('score')} | reason={r.get('reason')}")
+    for i, it in enumerate(items[:5], start=1):
+        print(f"{i:02d}. {it.get('title','')} | score={it.get('score')} | reason={it.get('reason')}")
 
-    dbg = out.get("debug") or {}
+    dbg = out.get("debug", {})
     if dbg:
         print("\n[DEBUG]")
-        for k in sorted(dbg.keys()):
-            print("-", k, ":", dbg.get(k))
+        for k, v in dbg.items():
+            print(f"- {k}: {v}")
 
 
 if __name__ == "__main__":
