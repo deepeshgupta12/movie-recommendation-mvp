@@ -1,170 +1,287 @@
-# ui/streamlit_app.py
-
-from __future__ import annotations
-
-import time
-from typing import Any, Dict, List  # noqa: UP035
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional  # noqa: UP035
 
 import requests
 import streamlit as st
 
-API_BASE_DEFAULT = "http://127.0.0.1:8004"
-PLACEHOLDER_POSTER = "https://via.placeholder.com/300x450?text=No+Poster"
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+POSTER_CACHE_PATH = PROJECT_ROOT / "data" / "processed" / "poster_cache_v4.json"
+
+DEFAULT_API_BASE = "http://127.0.0.1:8004"
+DEFAULT_SPLIT = "val"
+DEFAULT_USER_IDX = 9764
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_poster_cache() -> Dict[str, str]:
+    if POSTER_CACHE_PATH.exists():
+        try:
+            return json.loads(POSTER_CACHE_PATH.read_text())
+        except Exception:
+            # If cache is corrupt, just ignore it
+            return {}
+    return {}
 
 
-def _get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+POSTER_CACHE = load_poster_cache()
 
 
-def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.post(url, json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()
+def _get(url: str, timeout: int = 60) -> Dict[str, Any]:
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def _group_by_reason(recs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for r in recs:
-        key = r.get("reason") or "Recommended for you"
-        groups.setdefault(key, []).append(r)
-    return groups
+def _post(url: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    if not resp.content:
+        return {}
+    return resp.json()
 
 
-def _render_card(rec: Dict[str, Any], user_idx: int, api_base: str):
-    poster = rec.get("poster_url") or PLACEHOLDER_POSTER
+def resolve_poster_url(rec: Dict[str, Any]) -> Optional[str]:
+    """
+    Poster resolution strategy:
+    1) If API already attached poster_url -> use that.
+    2) Else look up by movieId in poster_cache_v4.json.
+    3) Else return None (UI will render a text placeholder).
+    """
+    if rec.get("poster_url"):
+        return rec["poster_url"]
+
+    movie_id = rec.get("movieId") or rec.get("movie_id")
+    if movie_id is None:
+        return None
+
+    # poster_cache_v4.json likely has string keys
+    key_str = str(movie_id)
+    if key_str in POSTER_CACHE:
+        return POSTER_CACHE[key_str]
+
+    # just in case keys are numeric
+    return POSTER_CACHE.get(movie_id)
+
+
+def group_recommendations(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Very simple grouping based on the `reason` field.
+    This mirrors the intent of:
+      - "Similar to your taste"
+      - "Popular among similar users"
+      - Future buckets like "Continue watching" can be wired later.
+    """
+    buckets: Dict[str, List[Dict[str, Any]]] = {
+        "Similar to your taste": [],
+        "Popular among similar users": [],
+        "Other recommendations": [],
+    }
+    for rec in items:
+        reason = (rec.get("reason") or "").lower()
+        if "similar to your taste" in reason:
+            buckets["Similar to your taste"].append(rec)
+        elif "popular among similar users" in reason or "popular" in reason:
+            buckets["Popular among similar users"].append(rec)
+        else:
+            buckets["Other recommendations"].append(rec)
+    # Drop empty buckets
+    return {k: v for k, v in buckets.items() if v}
+
+
+def send_feedback(api_base: str, user_idx: int, rec: Dict[str, Any], event: str) -> None:
+    """
+    Send feedback to /feedback.
+
+    Allowed events (as per API v4 schema):
+      - like
+      - remove_like
+      - watched
+      - watch_later
+      - remove_watch_later
+      - skip
+    """
+    payload = {
+        "user_idx": user_idx,
+        "item_idx": rec.get("item_idx"),
+        "movieId": rec.get("movieId"),
+        "event": event,
+        "score": rec.get("score"),
+        "reason": rec.get("reason"),
+    }
+    try:
+        out = _post(f"{api_base}/feedback", payload)
+        st.toast(f"Feedback '{event}' recorded.", icon="✅")
+        if out.get("detail"):
+            st.caption(f"Server detail: {out['detail']}")
+    except requests.HTTPError as e:
+        try:
+            detail = e.response.text
+        except Exception:
+            detail = str(e)
+        st.error(f"Feedback failed: {detail}")
+    except Exception as e:
+        st.error(f"Feedback failed: {e}")
+
+
+def render_card(rec: Dict[str, Any], user_idx: int, api_base: str) -> None:
+    poster_url = resolve_poster_url(rec)
     title = rec.get("title") or f"Item {rec.get('item_idx')}"
     score = rec.get("score")
+    reason = rec.get("reason") or ""
 
     with st.container(border=True):
-        st.image(poster, use_container_width=True)
+        # Poster
+        if poster_url:
+            st.image(poster_url, use_column_width=True)
+        else:
+            # Simple placeholder so we never show a broken image
+            st.markdown(
+                f"""
+                <div style="
+                    height: 280px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    border-radius: 4px;
+                    border: 1px solid #444;
+                    font-size: 0.85rem;
+                    text-align: center;
+                    padding: 0.5rem;
+                ">
+                    Poster unavailable<br/><span style="opacity:0.7;">{title}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        # Title + score + reason
         st.markdown(f"**{title}**")
-        st.caption(f"Score: {score:.4f} | {rec.get('reason')}")
+        if score is not None:
+            st.caption(f"Score: {score:.4f} | {reason}")
+        else:
+            st.caption(reason)
 
+        # Feedback buttons
         c1, c2, c3, c4 = st.columns(4)
-        item_idx = rec["item_idx"]
-
-        def send(ev_type: str):
-            _post(f"{api_base}/feedback", {
-                "user_idx": int(user_idx),
-                "item_idx": int(item_idx),
-                "event_type": ev_type,
-            })
-
-        if c1.button("👍 Like", key=f"like_{user_idx}_{item_idx}"):
-            send("liked")
-            st.toast("Liked")
-        if c2.button("✅ Watched", key=f"watched_{user_idx}_{item_idx}"):
-            send("watched")
-            st.toast("Marked as watched")
-        if c3.button("🕒 Watch later", key=f"wl_{user_idx}_{item_idx}"):
-            send("watch_later")
-            st.toast("Added to watch later")
-        if c4.button("▶️ Start", key=f"start_{user_idx}_{item_idx}"):
-            send("started")
-            st.toast("Started watching")
+        if c1.button("Like", key=f"like-{user_idx}-{rec.get('item_idx')}"):
+            send_feedback(api_base, user_idx, rec, "like")
+        if c2.button("Watched", key=f"watched-{user_idx}-{rec.get('item_idx')}"):
+            send_feedback(api_base, user_idx, rec, "watched")
+        if c3.button("Watch later", key=f"watchlater-{user_idx}-{rec.get('item_idx')}"):
+            send_feedback(api_base, user_idx, rec, "watch_later")
+        # Interpret "Start" as a lightweight "watched" signal for now
+        if c4.button("Start", key=f"start-{user_idx}-{rec.get('item_idx')}"):
+            send_feedback(api_base, user_idx, rec, "watched")
 
 
-def main():
-    st.set_page_config(page_title="Movie Reco MVP - V4", layout="wide")
+# -----------------------------------------------------------------------------
+# Main app
+# -----------------------------------------------------------------------------
+def main() -> None:
+    st.set_page_config(
+        page_title="Movie Recommendation MVP - V4",
+        layout="wide",
+    )
+
     st.title("Movie Recommendation MVP - V4")
-    st.caption("Session-aware + Diversity + Live Feedback Loop")
+    st.caption("Session-aware • Diversity • Live Feedback Loop")
 
-    with st.sidebar:
-        st.subheader("API")
-        api_base = st.text_input("Base URL", value=API_BASE_DEFAULT)
-        split = st.selectbox("Split", ["val", "test"], index=0)
-        apply_diversity = st.checkbox("Apply diversity", value=True)
-        debug = st.checkbox("Debug payload", value=False)
+    # Sidebar – controls
+    st.sidebar.header("Mode")
+    mode = st.sidebar.radio(
+        "Select version",
+        options=["V4 (Session-aware)", "V3 (Feedback-loop)"],
+        index=0,
+        help="V3 path is still available for comparison; main focus is V4.",
+    )
 
-        st.divider()
-        st.subheader("User")
-        user_idx = st.number_input("user_idx", min_value=0, value=9764, step=1)
-        k = st.slider("Top-K", 5, 50, 20)
+    st.sidebar.header("API")
+    api_base = st.sidebar.text_input("Base URL", DEFAULT_API_BASE)
+    split = st.sidebar.selectbox("Split", options=["val", "test"], index=0)
 
-        fetch = st.button("Get recommendations")
+    st.sidebar.header("Request")
+    user_idx = st.sidebar.number_input(
+        "user_idx",
+        min_value=0,
+        max_value=200000,
+        value=DEFAULT_USER_IDX,
+        step=1,
+    )
+    k = st.sidebar.slider("k", min_value=5, max_value=50, value=20, step=1)
+    include_titles = st.sidebar.checkbox("include_titles", value=True)
+    debug = st.sidebar.checkbox("debug", value=False)
+    apply_diversity = st.sidebar.checkbox("apply_diversity (V4)", value=True)
 
-    if "last_payload" not in st.session_state:
-        st.session_state.last_payload = None
-    if "last_fetch_ts" not in st.session_state:
-        st.session_state.last_fetch_ts = 0.0
+    # Health check
+    health_ok = False
+    try:
+        health = _get(f"{api_base}/health")
+        st.success(f"API ok: {health}")
+        health_ok = True
+    except Exception as e:
+        st.error(f"Health check failed: {e}")
 
-    def do_fetch():
-        payload = _get(
-            f"{api_base}/recommend",
-            {
-                "user_idx": int(user_idx),
-                "k": int(k),
-                "include_titles": True,
-                "debug": bool(debug),
-                "split": split,
-                "apply_diversity": bool(apply_diversity),
-            },
-        )
-        st.session_state.last_payload = payload
-        st.session_state.last_fetch_ts = time.time()
-
-    if fetch:
-        do_fetch()
-
-    # Auto-refresh after feedback button clicks
-    # Streamlit reruns script automatically; we can refresh if we already have payload.
-    if st.session_state.last_payload is not None and (time.time() - st.session_state.last_fetch_ts) > 0.2:
-        # light refresh hook button
-        if st.button("Refresh recommendations"):
-            do_fetch()
-
-    payload = st.session_state.last_payload
-    if not payload:
-        st.info("Select user and click **Get recommendations**.")
+    # Do not proceed if health fails
+    if not health_ok:
         return
 
-    recs = payload.get("recommendations", [])
-    if not recs:
-        st.warning("No recommendations returned for this user.")
-        if debug and payload.get("debug"):
-            st.json(payload["debug"])
+    # Only V4 UI is implemented in this file; V3 keeps old behaviour via its own route
+    if mode.startswith("V3"):
+        st.info("V3 UI path is not wired here. Use the older V3 app/script for comparison.")
         return
 
-    # Group display with headings
-    groups = _group_by_reason(recs)
+    if st.button("Get Recommendations"):
+        # Build URL exactly like demo_v4_api does
+        params = {
+            "user_idx": int(user_idx),
+            "k": int(k),
+            "include_titles": bool(include_titles),
+            "debug": bool(debug),
+            "split": split,
+            "apply_diversity": bool(apply_diversity),
+        }
+        try:
+            resp = requests.get(f"{api_base}/recommend", params=params, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.HTTPError as e:
+            try:
+                body = e.response.text
+            except Exception:
+                body = str(e)
+            st.error(f"Recommend failed: {body}")
+            return
+        except Exception as e:
+            st.error(f"Recommend failed: {e}")
+            return
 
-    # Keep a predictable order of key buckets
-    reason_order = [
-        "Because you watched",
-        "Similar to your taste",
-        "Popular among similar users",
-        "Recommended for you",
-    ]
+        items = data.get("items") or data.get("recommendations") or []
 
-    ordered_keys = []
-    for ro in reason_order:
-        for k_reason in groups.keys():
-            if k_reason.startswith(ro):
-                if k_reason not in ordered_keys:
-                    ordered_keys.append(k_reason)
-
-    for k_reason in groups.keys():
-        if k_reason not in ordered_keys:
-            ordered_keys.append(k_reason)
-
-    for reason in ordered_keys:
-        items = groups.get(reason, [])
         if not items:
-            continue
+            st.info("No recommendations returned.")
+            return
 
-        st.subheader(reason)
+        # Group into buckets
+        buckets = group_recommendations(items)
 
-        cols = st.columns(5)
-        for i, rec in enumerate(items):
-            with cols[i % 5]:
-                _render_card(rec, user_idx=int(user_idx), api_base=api_base)
+        # Optional debug block
+        if debug and "debug" in data:
+            with st.expander("Debug payload from API"):
+                st.json(data["debug"])
 
-    if debug and payload.get("debug"):
-        st.divider()
-        st.subheader("Debug")
-        st.json(payload["debug"])
+        # Render each section
+        for section_name, recs in buckets.items():
+            st.subheader(section_name)
+            cols = st.columns(5)
+            for i, rec in enumerate(recs[: k ]):
+                with cols[i % 5]:
+                    render_card(rec, int(user_idx), api_base)
 
 
 if __name__ == "__main__":
