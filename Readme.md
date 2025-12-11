@@ -1,4 +1,4 @@
-# 🎬 Movie Recommendation MVP — V1 ➜ V4 (through Step 9.x)
+# 🎬 Movie Recommendation MVP
 
 A hands-on, locally runnable, **end-to-end recommender systems playground** that evolves from classic baselines to a **Netflix-inspired hybrid stack** with neural retrieval, sequence modeling, candidate blending, learning-to-rank, a lightweight **online feedback loop**, and now a **session-aware, diversity‑aware V4 stack with posters + live interactions**.
 
